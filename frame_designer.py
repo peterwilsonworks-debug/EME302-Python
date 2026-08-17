@@ -12,6 +12,8 @@ notebook (see eme302_suite.py) or run standalone with `python frame_designer.py`
 
 Requires: numpy, matplotlib (tkinter ships with standard Python on Windows/Mac;
 on Linux install e.g. `sudo apt install python3-tk`).
+Xg = u(x)cos(alpha) - v(x)sin(alpha)
+Yg = u(x)sin(alpha) + v(x)cos(alpha)
 """
 
 import json
