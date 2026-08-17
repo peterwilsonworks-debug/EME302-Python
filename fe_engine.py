@@ -14,11 +14,19 @@ import numpy as np
 
 
 class Node:
-    def __init__(self, id_, x, y, support="Free"):
+    def __init__(self, id_, x, y, support="Free", roller_axis="Y"):
         self.id = id_
         self.x = x
         self.y = y
         self.support = support  # "Free", "Pinned", "Roller", "Fixed"
+        # Which global translation axis a "Roller" support restrains:
+        #   "Y" -> restrains vertical (global Y), free to slide horizontally
+        #          (roller sitting on a horizontal surface) -- this is the
+        #          previous hardcoded behaviour and remains the default.
+        #   "X" -> restrains horizontal (global X), free to slide vertically
+        #          (roller bearing against a vertical wall/surface).
+        # Ignored for any support type other than "Roller".
+        self.roller_axis = roller_axis
         self.loads = [0.0, 0.0, 0.0]  # Fx, Fy, M applied at this node
 
     def restrained_dofs(self):
@@ -28,8 +36,8 @@ class Node:
         elif self.support in ("Pinned",):
             return [0, 1]
         elif self.support == "Roller":
-            # Roller restrains vertical (global Y) translation only, by default
-            return [1]
+            # Restrains translation along whichever global axis is configured.
+            return [0] if self.roller_axis == "X" else [1]
         return []
 
 
@@ -92,6 +100,59 @@ class Element:
     def K_global(self):
         T = self.T()
         return T.T @ self.K_local() @ T
+
+    def f_eq_local_distributed(self):
+        """Equivalent local nodal load vector from ONLY the distributed
+        (uniform + trapezoidal) load component (zero vector if none)."""
+        L = self.L
+        w1, w2 = self.local_w1_w2()
+        return np.array([
+            [0.0],
+            [(L * (7*w1 + 3*w2)) / 20],
+            [(L**2 * (w1/20 + w2/30))],
+            [0.0],
+            [(L * (3*w1 + 7*w2)) / 20],
+            [-(L**2 * (w1/30 + w2/20))],
+        ])
+
+    def f_eq_local_point(self, P, a):
+        """Equivalent local nodal load vector from a single point load."""
+        L = self.L
+        b = L - a
+        return np.array([
+            [0.0],
+            [(P * b**2 * (3*a + b)) / L**3],
+            [(P * a * b**2) / L**2],
+            [0.0],
+            [(P * a**2 * (a + 3*b)) / L**3],
+            [-((P * a**2 * b) / L**2)],
+        ])
+
+    def f_eq_components_local(self):
+        """Return an ordered list of (label, 6x1 vector) -- one entry per
+        DISTINCT load type currently active on this element, in local
+        coordinates. Only includes types that actually contribute
+        (i.e. skips zero loads)."""
+        comps = []
+        w1, w2 = self.local_w1_w2()
+        if w1 != 0 or w2 != 0:
+            if self.udl != 0 and self.w1 == 0 and self.w2 == 0:
+                label = f"UDL (w={self.udl:g} N/m)"
+            elif w1 == w2:
+                label = f"UDL (w={w1:g} N/m)"
+            else:
+                label = f"Trapezoidal load (w1={w1:g} N/m @ i, w2={w2:g} N/m @ j)"
+            comps.append((label, self.f_eq_local_distributed()))
+        for (P, a) in self.point_loads:
+            comps.append((f"Point load (P={P:g} N @ a={a:g} m from i)",
+                          self.f_eq_local_point(P, a)))
+        return comps
+
+    def f_eq_components_global(self):
+        """Same as f_eq_components_local() but each vector transformed to
+        global coordinates."""
+        T = self.T()
+        return [(label, T.T @ vec) for label, vec in self.f_eq_components_local()]
 
     def f_eq_local(self):
         """Total equivalent local nodal load vector (6x1) from UDL/trapezoid + point loads."""
@@ -185,8 +246,12 @@ class Structure:
         # (nodal equivalent loads already included in QG; reactions balance total)
         R_full = KG @ q_full - QG
 
-        # per-element end forces (global then local)
+        # per-element end forces (global then local) and local end
+        # displacements (needed to reconstruct the true bending shape,
+        # including curvature from member loads, rather than just a
+        # straight line between the deformed node positions).
         elem_forces = {}
+        elem_disps = {}
         for el in self.elements:
             dofs = self.dof_ids(el.ni) + self.dof_ids(el.nj)
             qe = q_full[dofs, :]
@@ -194,9 +259,12 @@ class Structure:
             # local forces (for member end shear/moment/axial)
             Fl = el.T() @ Fg
             elem_forces[el.id] = {"global": Fg, "local": Fl}
+            # local end displacements [u1, v1, theta1, u2, v2, theta2]
+            elem_disps[el.id] = el.T() @ qe
 
         return {
             "KG": KG, "QG": QG, "q": q_full, "R": R_full,
             "restrained": restrained, "free": free,
             "elem_forces": elem_forces,
+            "elem_disps": elem_disps,
         }

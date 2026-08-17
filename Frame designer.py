@@ -27,6 +27,13 @@ from matplotlib.patches import Circle
 from fe_engine import Node, Element, Structure
 
 SUPPORT_TYPES = ["Free", "Pinned", "Roller", "Fixed"]
+# Display label -> internal axis code, for which global translation a
+# "Roller" support restrains.
+ROLLER_AXIS_LABELS = {
+    "Y (vertical) - rolls sideways": "Y",
+    "X (horizontal) - rolls up/down": "X",
+}
+ROLLER_AXIS_LABELS_REV = {v: k for k, v in ROLLER_AXIS_LABELS.items()}
 GRID_SNAP = 0.25  # metres, snap tolerance when clicking
 DEFAULT_VIEW_HALF_RANGE = 10.0  # metres; fixed canvas view, does not autoscale
 
@@ -43,6 +50,7 @@ class NodeItem:
         self.x = x
         self.y = y
         self.support = "Free"
+        self.roller_axis = "Y"   # which global axis a Roller support restrains: "Y" or "X"
         self.Fx = 0.0
         self.Fy = 0.0
         self.M = 0.0
@@ -180,11 +188,17 @@ class FrameDesignerApp:
 
         self.tab_props = ttk.Frame(self.tabs)
         self.tab_results = ttk.Frame(self.tabs)
+        self.tab_fbd = ttk.Frame(self.tabs)
+        self.tab_matrices = ttk.Frame(self.tabs)
         self.tabs.add(self.tab_props, text="Properties")
         self.tabs.add(self.tab_results, text="Results")
+        self.tabs.add(self.tab_fbd, text="Free-Body Diagrams")
+        self.tabs.add(self.tab_matrices, text="Matrices")
 
         self._build_props_tab()
         self._build_results_tab()
+        self._build_fbd_tab()
+        self._build_matrices_tab()
 
     def _build_props_tab(self):
         # Wrap all Properties-tab content in a scrollable canvas, since the
@@ -279,6 +293,15 @@ class FrameDesignerApp:
         cb = ttk.Combobox(parent, textvariable=self.n_support, values=SUPPORT_TYPES,
                            state="readonly", width=10)
         cb.grid(row=row, column=1, sticky="w", padx=4, pady=2)
+        cb.bind("<<ComboboxSelected>>", self._on_support_type_changed)
+        row += 1
+
+        ttk.Label(parent, text="Roller restrains:").grid(row=row, column=0, sticky="w", padx=4)
+        self.n_roller_axis = tk.StringVar(value=ROLLER_AXIS_LABELS_REV["Y"])
+        self.n_roller_axis_cb = ttk.Combobox(
+            parent, textvariable=self.n_roller_axis,
+            values=list(ROLLER_AXIS_LABELS.keys()), state="readonly", width=26)
+        self.n_roller_axis_cb.grid(row=row, column=1, sticky="w", padx=4, pady=2)
         row += 1
 
         ttk.Label(parent, text="Fx (N):").grid(row=row, column=0, sticky="w", padx=4)
@@ -441,6 +464,91 @@ class FrameDesignerApp:
         self.results_text.insert("1.0", "Click SOLVE STRUCTURE to see results here.")
         self.results_text.configure(state="disabled")
 
+    def _build_fbd_tab(self):
+        outer = self.tab_fbd
+        bar = ttk.Frame(outer)
+        bar.pack(side="top", fill="x", padx=4, pady=4)
+        ttk.Button(bar, text="Refresh Diagrams", command=self._render_fbd).pack(side="left")
+        ttk.Label(bar, text="  DOF map (+ reactions once solved) and per-element free-body diagrams",
+                  font=("TkDefaultFont", 8), foreground="gray").pack(side="left")
+
+        # Scrollable host for the (potentially tall) matplotlib figure.
+        scroll_canvas = tk.Canvas(outer, highlightthickness=0, bg="white")
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=scroll_canvas.yview)
+        scroll_canvas.configure(yscrollcommand=vsb.set)
+        scroll_canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.fbd_inner = ttk.Frame(scroll_canvas)
+        fbd_window = scroll_canvas.create_window((0, 0), window=self.fbd_inner, anchor="nw")
+
+        def _on_frame_configure(event):
+            scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            scroll_canvas.itemconfig(fbd_window, width=event.width)
+
+        self.fbd_inner.bind("<Configure>", _on_frame_configure)
+        scroll_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            if event.num == 4:
+                scroll_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                scroll_canvas.yview_scroll(1, "units")
+            else:
+                scroll_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        def _bind_wheel(_event):
+            scroll_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            scroll_canvas.bind_all("<Button-4>", _on_mousewheel)
+            scroll_canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_wheel(_event):
+            scroll_canvas.unbind_all("<MouseWheel>")
+            scroll_canvas.unbind_all("<Button-4>")
+            scroll_canvas.unbind_all("<Button-5>")
+
+        scroll_canvas.bind("<Enter>", _bind_wheel)
+        scroll_canvas.bind("<Leave>", _unbind_wheel)
+
+        self.fbd_placeholder = ttk.Label(
+            self.fbd_inner,
+            text="Click 'Refresh Diagrams' (or SOLVE STRUCTURE) to build the DOF map "
+                 "and per-element free-body diagrams.",
+            wraplength=380, justify="left")
+        self.fbd_placeholder.pack(padx=8, pady=8, anchor="w")
+        self.fbd_canvas_widget = None
+
+    def _build_matrices_tab(self):
+        outer = self.tab_matrices
+        bar = ttk.Frame(outer)
+        bar.pack(side="top", fill="x", padx=4, pady=4)
+        ttk.Button(bar, text="Build / Refresh Matrices",
+                   command=self._generate_matrices_report).pack(side="left")
+        ttk.Label(bar, text="  DOF table, per-element K/T/K_global, equivalent load\n"
+                            "  vectors by type, assembled global stiffness matrix",
+                  font=("TkDefaultFont", 8), foreground="gray").pack(side="left")
+
+        text_frame = ttk.Frame(outer)
+        text_frame.pack(side="top", fill="both", expand=True, padx=4, pady=(0, 4))
+        self.matrices_text = tk.Text(text_frame, wrap="none", font=("Courier New", 9))
+        vsb = ttk.Scrollbar(text_frame, orient="vertical", command=self.matrices_text.yview)
+        hsb = ttk.Scrollbar(text_frame, orient="horizontal", command=self.matrices_text.xview)
+        self.matrices_text.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.matrices_text.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+
+        self.matrices_text.insert(
+            "1.0", "Click 'Build / Refresh Matrices' (or SOLVE STRUCTURE) to see DOF "
+                   "numbering, per-element K_local / T / K_global matrices, equivalent "
+                   "nodal load vectors by load type, and the assembled global stiffness "
+                   "matrix here.")
+        self.matrices_text.configure(state="disabled")
+
     # ------------------------------------------------------------------
     # Canvas interaction
     # ------------------------------------------------------------------
@@ -600,12 +708,19 @@ class FrameDesignerApp:
         self._load_elem_editor(e)
         self._redraw()
 
+    def _on_support_type_changed(self, _evt=None):
+        # Roller axis choice is only meaningful for Roller supports.
+        state = "readonly" if self.n_support.get() == "Roller" else "disabled"
+        self.n_roller_axis_cb.configure(state=state)
+
     def _load_node_editor(self, n):
         self.node_editor_target = n
         self.n_coord_lbl.config(text=f"Node: {n.label()}  ({n.x:.2f}, {n.y:.2f})")
         self.n_x.set(f"{n.x:.4f}")
         self.n_y.set(f"{n.y:.4f}")
         self.n_support.set(n.support)
+        self.n_roller_axis.set(ROLLER_AXIS_LABELS_REV.get(n.roller_axis, ROLLER_AXIS_LABELS_REV["Y"]))
+        self._on_support_type_changed()
         self.n_fx.set(str(n.Fx))
         self.n_fy.set(str(n.Fy))
         self.n_m.set(str(n.M))
@@ -645,6 +760,7 @@ class FrameDesignerApp:
             new_x = float(self.n_x.get())
             new_y = float(self.n_y.get())
             n.support = self.n_support.get()
+            n.roller_axis = ROLLER_AXIS_LABELS.get(self.n_roller_axis.get(), "Y")
             n.Fx = float(self.n_fx.get())
             n.Fy = float(self.n_fy.get())
             n.M = float(self.n_m.get())
@@ -803,6 +919,17 @@ class FrameDesignerApp:
         self._refresh_lists()
         self._redraw()
         self._set_results_text("Click SOLVE STRUCTURE to see results here.")
+        self._set_matrices_text("Click 'Build / Refresh Matrices' (or SOLVE STRUCTURE) to see "
+                                 "DOF numbering, element matrices, equivalent load vectors and "
+                                 "the assembled global stiffness matrix here.")
+        for child in self.fbd_inner.winfo_children():
+            child.destroy()
+        self.fbd_placeholder = ttk.Label(
+            self.fbd_inner,
+            text="Click 'Refresh Diagrams' (or SOLVE STRUCTURE) to build the DOF map "
+                 "and per-element free-body diagrams.",
+            wraplength=380, justify="left")
+        self.fbd_placeholder.pack(padx=8, pady=8, anchor="w")
 
     # ------------------------------------------------------------------
     # Solve
@@ -820,7 +947,7 @@ class FrameDesignerApp:
         fe_nodes = []
         node_map = {}
         for n in self.nodes:
-            fen = Node(n.id, n.x, n.y, support=n.support)
+            fen = Node(n.id, n.x, n.y, support=n.support, roller_axis=n.roller_axis)
             fen.loads = [n.Fx, n.Fy, n.M]
             fe_nodes.append(fen)
             node_map[n] = fen
@@ -847,6 +974,8 @@ class FrameDesignerApp:
         self.struct = struct
         self.show_deformed.set(True)
         self._display_results()
+        self._generate_matrices_report()
+        self._render_fbd()
         self._redraw()
         self.tabs.select(self.tab_results)
 
@@ -919,6 +1048,410 @@ class FrameDesignerApp:
         self.results_text.configure(state="disabled")
 
     # ------------------------------------------------------------------
+    # Free-body diagrams (DOF map + per-element)
+    # ------------------------------------------------------------------
+    def _restrained_local_dofs(self, n):
+        """Which local DOF indices (0=u, 1=v, 2=theta) a NodeItem's support
+        restrains -- mirrors fe_engine.Node.restrained_dofs()."""
+        if n.support == "Fixed":
+            return [0, 1, 2]
+        if n.support == "Pinned":
+            return [0, 1]
+        if n.support == "Roller":
+            return [0] if n.roller_axis == "X" else [1]
+        return []
+
+    def _render_fbd(self):
+        if not self.nodes:
+            messagebox.showinfo("No structure", "Add at least one node first.")
+            return
+
+        for child in self.fbd_inner.winfo_children():
+            child.destroy()
+
+        n_elem = len(self.elements)
+        ncols = 3 if n_elem > 3 else max(n_elem, 1)
+        nrows_elem = int(np.ceil(n_elem / ncols)) if n_elem else 0
+
+        fig_h = 5.0 + 2.3 * nrows_elem
+        fig = Figure(figsize=(9.4, fig_h), dpi=100)
+
+        if n_elem:
+            gs = fig.add_gridspec(1 + nrows_elem, ncols,
+                                   height_ratios=[3.2] + [1.0] * nrows_elem,
+                                   hspace=0.6, wspace=0.45)
+            ax_main = fig.add_subplot(gs[0, :])
+        else:
+            gs = fig.add_gridspec(1, 1)
+            ax_main = fig.add_subplot(gs[0, 0])
+
+        self._draw_dof_map(ax_main)
+
+        for i, e in enumerate(self.elements):
+            r = 1 + i // ncols
+            c = i % ncols
+            ax = fig.add_subplot(gs[r, c])
+            self._draw_element_fbd(ax, e)
+
+        canvas = FigureCanvasTkAgg(fig, master=self.fbd_inner)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.fbd_canvas_widget = canvas
+
+    def _draw_dof_map(self, ax):
+        ax.set_aspect("equal")
+        solved = self.result is not None
+        ax.set_title("Global DOF map" + (" & reactions" if solved else "") +
+                     "   (green = free DOF, red = restrained DOF)", fontsize=10)
+        ax.grid(True, linestyle=":", alpha=0.4)
+
+        for e in self.elements:
+            ax.plot([e.ni.x, e.nj.x], [e.ni.y, e.nj.y], color="tab:blue", lw=2, zorder=1)
+
+        xs = [n.x for n in self.nodes]
+        ys = [n.y for n in self.nodes]
+        span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0) if xs else 1.0
+        arrow_len = max(span * 0.06, 0.25)
+
+        for idx, n in enumerate(self.nodes):
+            ax.scatter([n.x], [n.y], s=45, color="black", zorder=4)
+            ax.annotate(n.label(), (n.x, n.y), fontsize=8, xytext=(5, 10),
+                        textcoords="offset points")
+            self._draw_support_symbol(n)
+
+            restrained = self._restrained_local_dofs(n)
+            dof_ids = [3*idx, 3*idx+1, 3*idx+2]
+
+            col_u = "tab:red" if 0 in restrained else "tab:green"
+            ax.annotate("", xy=(n.x + arrow_len, n.y), xytext=(n.x, n.y),
+                        arrowprops=dict(arrowstyle="->", color=col_u, lw=1.6), zorder=5)
+            ax.annotate(f"u:{dof_ids[0]}", (n.x + arrow_len, n.y), fontsize=6.5,
+                        color=col_u, xytext=(2, -2), textcoords="offset points")
+
+            col_v = "tab:red" if 1 in restrained else "tab:green"
+            ax.annotate("", xy=(n.x, n.y + arrow_len), xytext=(n.x, n.y),
+                        arrowprops=dict(arrowstyle="->", color=col_v, lw=1.6), zorder=5)
+            ax.annotate(f"v:{dof_ids[1]}", (n.x, n.y + arrow_len), fontsize=6.5,
+                        color=col_v, xytext=(2, 2), textcoords="offset points")
+
+            col_t = "tab:red" if 2 in restrained else "tab:green"
+            cx, cy = n.x + arrow_len * 0.6, n.y + arrow_len * 0.6
+            circ = Circle((cx, cy), arrow_len * 0.22, fill=False, color=col_t, lw=1.4, zorder=5)
+            ax.add_patch(circ)
+            ax.annotate(f"\u03b8:{dof_ids[2]}", (cx, cy + arrow_len * 0.32), fontsize=6.5,
+                        color=col_t, ha="center")
+
+            if solved:
+                Rx, Ry, Rm = (self.result["R"][dof_ids[0], 0],
+                              self.result["R"][dof_ids[1], 0],
+                              self.result["R"][dof_ids[2], 0])
+                if abs(Rx) > 1e-6 or abs(Ry) > 1e-6 or abs(Rm) > 1e-6:
+                    ax.annotate(f"R=({Rx:.1f}, {Ry:.1f}) N\nM={Rm:.1f} Nm",
+                                (n.x, n.y - arrow_len * 1.6), fontsize=6.5,
+                                color="tab:purple", ha="center", va="top")
+
+        if xs:
+            pad = max(span * 0.35, 1.0)
+            ax.set_xlim(min(xs) - pad, max(xs) + pad)
+            ax.set_ylim(min(ys) - pad, max(ys) + pad)
+
+    def _draw_element_fbd(self, ax, e):
+        """Isolated free-body diagram for a single element: local axes,
+        applied loads, and (once solved) the actual member end forces."""
+        ax.set_title(e.label() + f"  L={e.length():.2f} m", fontsize=8)
+        ax.axis("off")
+
+        Ld = 2.0  # normalized display length (not to physical scale)
+        ax.plot([0, Ld], [0, 0], color="black", lw=2.5, zorder=1)
+        ax.scatter([0, Ld], [0, 0], color="black", s=25, zorder=2)
+        ax.annotate(f"N{e.ni.id}", (0, 0), xytext=(-2, -16),
+                    textcoords="offset points", fontsize=6.5, ha="center")
+        ax.annotate(f"N{e.nj.id}", (Ld, 0), xytext=(2, -16),
+                    textcoords="offset points", fontsize=6.5, ha="center")
+
+        # local axes triad
+        ax.annotate("", xy=(0.35, 0), xytext=(0, 0),
+                    arrowprops=dict(arrowstyle="->", color="gray", lw=1))
+        ax.annotate("x'", (0.4, -0.03), fontsize=6.5, color="gray")
+        ax.annotate("", xy=(0, 0.35), xytext=(0, 0),
+                    arrowprops=dict(arrowstyle="->", color="gray", lw=1))
+        ax.annotate("y'", (0.05, 0.38), fontsize=6.5, color="gray")
+
+        # applied distributed load
+        w1e, w2e = e.udl + e.w1, e.udl + e.w2
+        if w1e != 0 or w2e != 0:
+            for k in range(5):
+                t = k / 4
+                w = w1e * (1 - t) + w2e * t
+                if w == 0:
+                    continue
+                x0 = t * Ld
+                mag = 0.22 * np.sign(w)
+                ax.annotate("", xy=(x0, 0), xytext=(x0, mag),
+                            arrowprops=dict(arrowstyle="->", color="tab:green", lw=1))
+            ax.annotate(f"w: {w1e:.3g} \u2192 {w2e:.3g} N/m", (Ld/2, 0.32),
+                        fontsize=6, color="tab:green", ha="center")
+
+        # applied point loads
+        L = e.length()
+        for (P, a) in e.point_loads:
+            t = a / L if L > 0 else 0
+            x0 = t * Ld
+            mag = 0.3 * np.sign(P)
+            ax.annotate("", xy=(x0, 0), xytext=(x0, mag),
+                        arrowprops=dict(arrowstyle="->", color="tab:red", lw=1.6))
+            ax.annotate(f"P={P:g} N", (x0, mag + 0.06), fontsize=6, color="tab:red", ha="center")
+
+        # actual member end forces, once solved (local axes: axial, shear, moment)
+        if self.result is not None and "elem_forces" in self.result:
+            Fl = self.result["elem_forces"].get(e.id, {}).get("local")
+        else:
+            Fl = None
+        if Fl is not None:
+            Ni_, Vi_, Mi_ = Fl[0, 0], Fl[1, 0], Fl[2, 0]
+            Nj_, Vj_, Mj_ = Fl[3, 0], Fl[4, 0], Fl[5, 0]
+            ax.annotate(f"N={Ni_:.1f} N\nV={Vi_:.1f} N\nM={Mi_:.1f} Nm", (0, -0.58),
+                        fontsize=6, ha="center", va="top", color="tab:purple")
+            ax.annotate(f"N={Nj_:.1f} N\nV={Vj_:.1f} N\nM={Mj_:.1f} Nm", (Ld, -0.58),
+                        fontsize=6, ha="center", va="top", color="tab:purple")
+        else:
+            ax.annotate("(solve to see member end forces)", (Ld/2, -0.55),
+                        fontsize=6, ha="center", color="gray")
+
+        ax.set_xlim(-0.65, Ld + 0.65)
+        ax.set_ylim(-1.05, 0.7)
+        ax.set_aspect("equal")
+
+    # ------------------------------------------------------------------
+    # Matrices report (DOF table, per-element K/T, equivalent loads, K_total)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _format_matrix(M, row_labels=None, col_labels=None, fmt="{:>11.4g}"):
+        n_r, n_c = M.shape
+        lines = []
+        if col_labels is not None:
+            lines.append(" " * 9 + "".join(f"{c:>11}" for c in col_labels))
+        for i in range(n_r):
+            rl = row_labels[i] if row_labels is not None else str(i)
+            row = f"{rl:>9}" + "".join(fmt.format(M[i, j]) for j in range(n_c))
+            lines.append(row)
+        return "\n".join(lines)
+
+    def _generate_matrices_report(self):
+        if not self.nodes:
+            messagebox.showinfo("No structure", "Add at least one node first.")
+            return
+        if not self.elements:
+            messagebox.showinfo("No elements", "Add at least one element first.")
+            return
+
+        lines = []
+        lines.append("=" * 72)
+        lines.append("DEGREES OF FREEDOM")
+        lines.append("=" * 72)
+        lines.append(f"{'Node':<8}{'u dof':<12}{'v dof':<12}{'theta dof':<14}Support")
+        for idx, n in enumerate(self.nodes):
+            restrained = self._restrained_local_dofs(n)
+
+            def tag(local_i, gdof):
+                return f"{gdof} ({'R' if local_i in restrained else 'F'})"
+
+            supp = n.support + (f" [{n.roller_axis}]" if n.support == "Roller" else "")
+            lines.append(f"{n.label():<8}{tag(0, 3*idx):<12}{tag(1, 3*idx+1):<12}"
+                         f"{tag(2, 3*idx+2):<14}{supp}")
+        lines.append("(F = free DOF, R = restrained DOF; number shown is the global DOF index)")
+        lines.append("")
+
+        lines.append("=" * 72)
+        lines.append("APPLIED NODAL LOAD VECTOR")
+        lines.append("=" * 72)
+        any_nodal = False
+        for idx, n in enumerate(self.nodes):
+            if n.Fx != 0 or n.Fy != 0 or n.M != 0:
+                any_nodal = True
+                lines.append(f"{n.label()}: Fx={n.Fx:g} N (dof {3*idx}), "
+                             f"Fy={n.Fy:g} N (dof {3*idx+1}), M={n.M:g} Nm (dof {3*idx+2})")
+        if not any_nodal:
+            lines.append("(no nodal point loads defined)")
+        lines.append("")
+
+        ndof = 3 * len(self.nodes)
+        node_map = {}
+        fe_nodes = []
+        for n in self.nodes:
+            fen = Node(n.id, n.x, n.y, support=n.support, roller_axis=n.roller_axis)
+            fe_nodes.append(fen)
+            node_map[n] = fen
+        fe_elements = []
+        for e in self.elements:
+            fee = Element(e.id, node_map[e.ni], node_map[e.nj], E=e.E, A=e.A, I=e.I,
+                          udl=e.udl, w1=e.w1, w2=e.w2,
+                          point_loads=[(P, a) for (P, a) in e.point_loads])
+            fe_elements.append(fee)
+
+        KG_total = np.zeros((ndof, ndof))
+
+        for gi, e in zip(self.elements, fe_elements):
+            lines.append("=" * 72)
+            lines.append(f"ELEMENT {gi.label()}   L={e.L:.4f} m   angle={np.degrees(e.alpha):.2f} deg")
+            lines.append("=" * 72)
+            lines.append(f"E={e.E:g} Pa,  A={e.A:g} m^2,  I={e.I:g} m^4")
+            lines.append("")
+
+            dofs = ([3*self.nodes.index(gi.ni)+k for k in range(3)]
+                    + [3*self.nodes.index(gi.nj)+k for k in range(3)])
+            local_labels = [f"u{gi.ni.id}", f"v{gi.ni.id}", f"th{gi.ni.id}",
+                             f"u{gi.nj.id}", f"v{gi.nj.id}", f"th{gi.nj.id}"]
+            global_labels = [str(d) for d in dofs]
+
+            lines.append("K_local (element stiffness matrix, local axes, 6x6):")
+            lines.append(self._format_matrix(e.K_local(), local_labels, local_labels))
+            lines.append("")
+            lines.append("T  (local disp/force = T @ global disp/force):")
+            lines.append(self._format_matrix(e.T(), local_labels, local_labels))
+            lines.append("")
+            Kg = e.K_global()
+            lines.append(f"K_global = T^T @ K_local @ T   (assembles into global dofs {global_labels}):")
+            lines.append(self._format_matrix(Kg, global_labels, global_labels))
+            lines.append("")
+
+            comps = e.f_eq_components_local()
+            if comps:
+                lines.append("Equivalent nodal load vector, by load type:")
+                for label, vec in comps:
+                    lines.append(f"  [{label}]")
+                    lines.append("    local:  " + ", ".join(
+                        f"{local_labels[i]}={vec[i,0]:.4g}" for i in range(6)))
+                    gvec = e.T().T @ vec
+                    lines.append("    global: " + ", ".join(
+                        f"dof{dofs[i]}={gvec[i,0]:.4g}" for i in range(6)))
+                total_local = e.f_eq_local()
+                lines.append("  [TOTAL for this element]")
+                lines.append("    local:  " + ", ".join(
+                    f"{local_labels[i]}={total_local[i,0]:.4g}" for i in range(6)))
+            else:
+                lines.append("(no distributed/point loads on this element)")
+            lines.append("")
+
+            for a in range(6):
+                for b in range(6):
+                    KG_total[dofs[a], dofs[b]] += Kg[a, b]
+
+        lines.append("=" * 72)
+        lines.append("ASSEMBLED GLOBAL STIFFNESS MATRIX  K_total  (sum of all element K_global,")
+        lines.append("mapped into their global DOFs)")
+        lines.append("=" * 72)
+        all_labels = []
+        for n in self.nodes:
+            all_labels += [f"u{n.id}", f"v{n.id}", f"th{n.id}"]
+        if ndof <= 24:
+            lines.append(self._format_matrix(KG_total, all_labels, all_labels))
+        else:
+            lines.append(f"({ndof}x{ndof} -- printed in blocks of 8 columns for readability)")
+            block = 8
+            for start in range(0, ndof, block):
+                end = min(start + block, ndof)
+                lines.append(f"-- columns {all_labels[start:end]} --")
+                lines.append(self._format_matrix(KG_total[:, start:end], all_labels,
+                                                  all_labels[start:end]))
+                lines.append("")
+
+        self._set_matrices_text("\n".join(lines))
+
+    def _set_matrices_text(self, text):
+        self.matrices_text.configure(state="normal")
+        self.matrices_text.delete("1.0", "end")
+        self.matrices_text.insert("1.0", text)
+        self.matrices_text.configure(state="disabled")
+
+    # ------------------------------------------------------------------
+    # Deformed shape reconstruction
+    # ------------------------------------------------------------------
+    def _element_deformed_points(self, e, n_pts=25):
+        """Return (X, Y) arrays tracing the TRUE deformed shape of element e
+        (scaled by self.deformed_scale), including the curvature caused by
+        UDL / trapezoidal / point loads on the member -- not just a straight
+        line between the two deformed end points.
+
+        This works by superposition, exactly as in beam theory:
+          total local transverse deflection w(x) = w_bend(x) + w0(x)
+        where w_bend(x) is the standard cubic Hermite interpolation driven
+        by the actual nodal end displacements/rotations (v1, th1, v2, th2),
+        and w0(x) is the deflected shape of a *fixed-fixed* beam carrying
+        the element's own member loads (zero displacement/slope at both
+        ends by definition) -- i.e. exactly the sag/curvature a UDL or
+        point load introduces between the nodes, which is otherwise
+        invisible if you only connect the two deformed node positions with
+        a straight line.
+        """
+        if self.result is None or "elem_disps" not in self.result:
+            return None
+        disp = self.result["elem_disps"].get(e.id)
+        if disp is None:
+            return None
+        u1, v1, th1, u2, v2, th2 = disp[:, 0]
+
+        L = e.length()
+        if L <= 0:
+            return None
+        EI = e.E * e.I
+
+        # Fixed-end shear/moment at node i for this element's actual load
+        # (same closed-form expressions used in fe_engine.Element.f_eq_local).
+        w1e, w2e = e.udl + e.w1, e.udl + e.w2
+        Mi = (L**2) * (w1e/20 + w2e/30)
+        Vi = (L * (7*w1e + 3*w2e)) / 20
+        for (P, a) in e.point_loads:
+            b = L - a
+            Vi += (P * b**2 * (3*a + b)) / L**3
+            Mi += (P * a * b**2) / L**2
+
+        xs = np.linspace(0.0, L, n_pts)
+
+        def trapezoid_moment(x):
+            return w1e * x**2 / 2 + (w2e - w1e) * x**3 / (6*L)
+
+        def point_moment(x):
+            m = 0.0
+            for (P, a) in e.point_loads:
+                if a <= x:
+                    m += P * (x - a)
+            return m
+
+        # Bending moment along the (statically-consistent) fixed-fixed
+        # member, built from equilibrium of the free body 0..x.
+        M0 = np.array([Mi - Vi * x + trapezoid_moment(x) + point_moment(x) for x in xs])
+
+        if abs(EI) > 1e-12:
+            curvature = M0 / EI
+            # cumulative trapezoidal integration, twice, both starting at 0
+            # (matches the fixed-fixed BCs w0(0)=w0'(0)=0 by construction)
+            v0p = np.concatenate(([0.0], np.cumsum(
+                0.5 * (curvature[1:] + curvature[:-1]) * np.diff(xs))))
+            v0 = np.concatenate(([0.0], np.cumsum(
+                0.5 * (v0p[1:] + v0p[:-1]) * np.diff(xs))))
+        else:
+            v0 = np.zeros_like(xs)
+
+        xi = xs / L
+        N1 = 1 - 3*xi**2 + 2*xi**3
+        N2 = L * (xi - 2*xi**2 + xi**3)
+        N3 = 3*xi**2 - 2*xi**3
+        N4 = L * (xi**3 - xi**2)
+        w_bend = N1*v1 + N2*th1 + N3*v2 + N4*th2
+
+        w_total = w_bend + v0
+        u_total = u1 + (u2 - u1) * xi
+
+        alpha = np.arctan2(e.nj.y - e.ni.y, e.nj.x - e.ni.x)
+        c, s = np.cos(alpha), np.sin(alpha)
+
+        scale = self.deformed_scale.get()
+        X = e.ni.x + xs * c + scale * (u_total * c - w_total * s)
+        Y = e.ni.y + xs * s + scale * (u_total * s + w_total * c)
+        return X, Y
+
+    # ------------------------------------------------------------------
     # Drawing
     # ------------------------------------------------------------------
     def _redraw(self):
@@ -955,17 +1488,12 @@ class FrameDesignerApp:
 
         # deformed shape
         if self.show_deformed.get() and self.result is not None:
-            scale = self.deformed_scale.get()
             for e in self.elements:
-                idx_i = self.nodes.index(next(n for n in self.nodes if n.id == e.ni.id))
-                idx_j = self.nodes.index(next(n for n in self.nodes if n.id == e.nj.id))
-                ui = self.result["q"][3*idx_i:3*idx_i+2, 0]
-                uj = self.result["q"][3*idx_j:3*idx_j+2, 0]
-                xi = e.ni.x + scale * ui[0]
-                yi = e.ni.y + scale * ui[1]
-                xj = e.nj.x + scale * uj[0]
-                yj = e.nj.y + scale * uj[1]
-                self.ax.plot([xi, xj], [yi, yj], color="tab:orange", lw=2, ls="--",
+                pts = self._element_deformed_points(e)
+                if pts is None:
+                    continue
+                X, Y = pts
+                self.ax.plot(X, Y, color="tab:orange", lw=2, ls="--",
                              zorder=3, alpha=0.9)
 
         # nodes
@@ -1002,11 +1530,22 @@ class FrameDesignerApp:
             tri_y = [n.y, n.y - s, n.y - s, n.y]
             self.ax.plot(tri_x, tri_y, color="black", lw=1.5)
         elif n.support == "Roller":
-            tri_x = [n.x, n.x - s*0.6, n.x + s*0.6, n.x]
-            tri_y = [n.y, n.y - s, n.y - s, n.y]
-            self.ax.plot(tri_x, tri_y, color="black", lw=1.5)
-            self.ax.plot([n.x - s*0.6, n.x + s*0.6], [n.y - s - 0.08, n.y - s - 0.08],
-                        color="black", lw=1.5)
+            if n.roller_axis == "X":
+                # Restrains horizontal (X) translation: draw as if bearing
+                # against a vertical wall to the left, free to slide up/down.
+                tri_x = [n.x, n.x - s, n.x - s, n.x]
+                tri_y = [n.y, n.y - s*0.6, n.y + s*0.6, n.y]
+                self.ax.plot(tri_x, tri_y, color="black", lw=1.5)
+                self.ax.plot([n.x - s - 0.08, n.x - s - 0.08],
+                             [n.y - s*0.6, n.y + s*0.6], color="black", lw=1.5)
+            else:
+                # Restrains vertical (Y) translation: standard roller resting
+                # on a horizontal surface, free to slide sideways.
+                tri_x = [n.x, n.x - s*0.6, n.x + s*0.6, n.x]
+                tri_y = [n.y, n.y - s, n.y - s, n.y]
+                self.ax.plot(tri_x, tri_y, color="black", lw=1.5)
+                self.ax.plot([n.x - s*0.6, n.x + s*0.6], [n.y - s - 0.08, n.y - s - 0.08],
+                            color="black", lw=1.5)
 
     def _draw_nodal_load_arrow(self, n):
         scale = 0.6
