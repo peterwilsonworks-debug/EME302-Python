@@ -260,57 +260,80 @@ class Element:
         if self.udl != 0:
             t, ax = self.dir_components(self.udl_dir)
             wt, wa = self.udl * t, self.udl * ax
+            f_n = np.array([[0.0],
+                            [wt * L / 2],
+                            [wt * L**2 / 12],
+                            [0.0],
+                            [wt * L / 2],
+                            [-wt * L**2 / 12]])
+            f_a = np.array([[wa * L / 2], [0.0], [0.0], [wa * L / 2], [0.0], [0.0]])
             terms.append({
                 "kind": "UDL", "direction": self.udl_dir,
                 "inputs": {"w": self.udl},
                 "t": t, "ax": ax, "w1_t": wt, "w2_t": wt, "p1_ax": wa, "p2_ax": wa,
-                "f": np.array([
-                    [wa * L / 2],
-                    [wt * L / 2],
-                    [wt * L**2 / 12],
-                    [wa * L / 2],
-                    [wt * L / 2],
-                    [-wt * L**2 / 12],
-                ]),
+                "f_normal": f_n, "f_axial": f_a, "f": f_n + f_a,
             })
 
         if self.w1 != 0 or self.w2 != 0:
             t, ax = self.dir_components(self.lvl_dir)
             w1t, w2t = self.w1 * t, self.w2 * t
             p1, p2 = self.w1 * ax, self.w2 * ax
+            f_n = np.array([[0.0],
+                            [(L * (7*w1t + 3*w2t)) / 20],
+                            [(L**2 * (w1t/20 + w2t/30))],
+                            [0.0],
+                            [(L * (3*w1t + 7*w2t)) / 20],
+                            [-(L**2 * (w1t/30 + w2t/20))]])
+            f_a = np.array([[(L * (2*p1 + p2)) / 6], [0.0], [0.0],
+                            [(L * (p1 + 2*p2)) / 6], [0.0], [0.0]])
             terms.append({
                 "kind": "LVL", "direction": self.lvl_dir,
                 "inputs": {"w1": self.w1, "w2": self.w2},
                 "t": t, "ax": ax, "w1_t": w1t, "w2_t": w2t, "p1_ax": p1, "p2_ax": p2,
-                "f": np.array([
-                    [(L * (2*p1 + p2)) / 6],
-                    [(L * (7*w1t + 3*w2t)) / 20],
-                    [(L**2 * (w1t/20 + w2t/30))],
-                    [(L * (p1 + 2*p2)) / 6],
-                    [(L * (3*w1t + 7*w2t)) / 20],
-                    [-(L**2 * (w1t/30 + w2t/20))],
-                ]),
+                "f_normal": f_n, "f_axial": f_a, "f": f_n + f_a,
             })
 
         for k, (P, a, d) in enumerate(self.point_loads):
             t, ax = self.dir_components(d)
             Pt, Pa = P * t, P * ax
             b = L - a
+            f_n = np.array([[0.0],
+                            [(Pt * b**2 * (3*a + b)) / L**3],
+                            [(Pt * a * b**2) / L**2],
+                            [0.0],
+                            [(Pt * a**2 * (a + 3*b)) / L**3],
+                            [-((Pt * a**2 * b) / L**2)]])
+            f_a = np.array([[Pa * b / L], [0.0], [0.0], [Pa * a / L], [0.0], [0.0]])
             terms.append({
                 "kind": "PL", "direction": d, "index": k,
                 "inputs": {"P": P, "a": a, "b": b},
                 "t": t, "ax": ax, "P_t": Pt, "P_ax": Pa,
-                "f": np.array([
-                    [Pa * b / L],
-                    [(Pt * b**2 * (3*a + b)) / L**3],
-                    [(Pt * a * b**2) / L**2],
-                    [Pa * a / L],
-                    [(Pt * a**2 * (a + 3*b)) / L**3],
-                    [-((Pt * a**2 * b) / L**2)],
-                ]),
+                "f_normal": f_n, "f_axial": f_a, "f": f_n + f_a,
             })
 
         return terms
+
+    def f_eq_parts_local(self):
+        """
+        The equivalent nodal load vector split into the part caused by the
+        NORMAL (transverse, bending) component of the span loads and the part
+        caused by their AXIAL component.
+
+        For a load perpendicular to the member the axial part is zero. A load
+        given in a global direction on an inclined member has both.
+        """
+        f_n = np.zeros((6, 1))
+        f_a = np.zeros((6, 1))
+        for t in self.f_eq_terms():
+            f_n = f_n + t["f_normal"]
+            f_a = f_a + t["f_axial"]
+        return f_n, f_a
+
+    def f_eq_parts_global(self):
+        """The same two vectors rotated into global axes."""
+        f_n, f_a = self.f_eq_parts_local()
+        Tt = self.T().T
+        return Tt @ f_n, Tt @ f_a
 
     def f_eq_local(self):
         """Total equivalent local nodal load vector (6x1) from the span loads."""
@@ -321,6 +344,55 @@ class Element:
 
     def f_eq_global(self):
         return self.T().T @ self.f_eq_local()
+
+    # ------------------------------------------------------------------
+    # Axial behaviour
+    # ------------------------------------------------------------------
+    def axial_state(self, qe_global):
+        """
+        Axial stretch, strain, stress and internal force, with bending
+        ignored.
+
+        In the local stiffness matrix the axial DOFs are uncoupled from the
+        bending ones, so the change in length is read straight off the two
+        local axial displacements:
+
+            dL      = u_j - u_i          (both in the member's own axes)
+            epsilon = dL / L             (average over the member)
+            sigma   = E epsilon
+
+        The internal axial force is reported as tension-positive. It is
+        constant along the member unless the span loads have an axial
+        component -- which is exactly what a non-perpendicular UDL gives --
+        in which case it varies linearly from end to end and epsilon above is
+        the average. P_i and P_j below are its values at the two ends.
+
+        Bending is ignored in the strict sense that this is the first-order
+        axial strain of the centroid; the extra shortening a bowed member
+        shows is a second-order effect and is not part of linear theory.
+        """
+        qe = np.asarray(qe_global, dtype=float).reshape(6, 1)
+        L = self.L
+        ql = (self.T() @ qe).ravel()
+        dL = ql[3] - ql[0]
+        eps = dL / L if L else 0.0
+        EA = self.E * self.A
+
+        Fl = (self.T() @ (self.K_global() @ qe - self.f_eq_global())).ravel()
+        # Fl[0], Fl[3] are the nodal forces on the element ends along local x.
+        # Tension-positive internal force: P(0) = -N_i, P(L) = N_j.
+        P_i, P_j = -Fl[0], Fl[3]
+        return {
+            "dL": dL,
+            "eps": eps,
+            "sigma": self.E * eps,
+            "EA": EA,
+            "P_i": P_i,
+            "P_j": P_j,
+            "eps_i": P_i / EA if EA else 0.0,
+            "eps_j": P_j / EA if EA else 0.0,
+            "uniform": abs(P_j - P_i) <= 1e-9 * max(abs(P_i), abs(P_j), 1.0),
+        }
 
     # ------------------------------------------------------------------
     # Deflected shape

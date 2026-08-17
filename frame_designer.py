@@ -1654,6 +1654,34 @@ class FrameDesignerPanel(ttk.Frame):
 
         lines.append("")
         lines.append("=" * 66)
+        lines.append("AXIAL STRAIN PER ELEMENT (bending ignored)")
+        lines.append("=" * 66)
+        lines.append("  element        dL (mm)     strain      microstrain   "
+                     "stress (MPa)")
+        lines.append("  " + "-" * 64)
+        varying = []
+        for e in self.elements:
+            fee = self.fe_elements.get(e)
+            if fee is None:
+                continue
+            st = fee.axial_state(r["q"][self.struct.element_dofs(fee), :])
+            lines.append(f"  {e.label():<14}{st['dL']*1e3:10.5f}  "
+                         f"{st['eps']:12.4e}  {st['eps']*1e6:11.3f}  "
+                         f"{st['sigma']/1e6:12.4f}")
+            if not st["uniform"]:
+                varying.append((e, st))
+        lines.append("  strain = (u_j - u_i)/L in the member's own axes; "
+                     "stress = E x strain")
+        if varying:
+            lines.append("")
+            lines.append("  These members carry an axial span load, so their axial force")
+            lines.append("  varies along the length and the strain above is the average:")
+            for e, st in varying:
+                lines.append(f"    {e.label():<14} P at node i end ={st['P_i']:12.2f} N"
+                             f"   at node j end ={st['P_j']:12.2f} N  (tension +ve)")
+
+        lines.append("")
+        lines.append("=" * 66)
         lines.append("PEAK MEMBER DEFLECTIONS (relative to the member chord)")
         lines.append("=" * 66)
         for e in self.elements:

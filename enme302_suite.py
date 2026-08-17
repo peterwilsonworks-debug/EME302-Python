@@ -636,6 +636,40 @@ LOAD DIRECTIONS
   a load quoted per metre of plan (snow is often given this way), multiply it
   by cos(member angle) before entering it.
 
+NORMAL AND AXIAL PARTS OF A NON-PERPENDICULAR LOAD
+  A load perpendicular to the member only bends it. A load given in a global
+  direction on an inclined member also pushes ALONG it, so its equivalent
+  nodal load vector has two parts:
+
+    NORMAL (transverse)  fills the v and theta rows -- this is the bending
+                         part, the one the classical beam formulas give
+    AXIAL                fills the u rows -- p_ax L / 2 at each end for a
+                         UDL -- and stretches or shortens the member
+
+  Both vectors are printed separately, in local and in global axes, on the
+  element tab, along with their sum. A useful check: for a vertical load the
+  X components of the two parts cancel exactly in the global vectors, because
+  the resultant can only be vertical.
+
+AXIAL STRAIN
+  The Results tab lists, for every element, the change in length, the axial
+  strain, the same in microstrain, and the axial stress. Step 9 of each
+  element tab shows the same thing worked through.
+
+  Bending is ignored: the axial DOFs are uncoupled from the bending DOFs in
+  K_local, so the strain comes straight from the two local axial
+  displacements,
+
+     dL = u_j - u_i        epsilon = dL / L        sigma = E epsilon
+
+  both u values being in the member's own axes. (The extra shortening a bowed
+  member shows is a second-order effect, outside linear theory.)
+
+  If a member carries an axial span load -- which is what a non-perpendicular
+  UDL gives it -- its internal axial force is not constant. It varies linearly
+  from end to end, the strain above is the average, and the two end values of
+  the force are listed underneath, tension positive.
+
 JOINTS AND END RELEASES
   Where several members share a node they are RIGIDLY connected by default:
   they share the joint's rotation, so moment passes straight through.
@@ -716,7 +750,13 @@ TABS
                               for each UDL, LVL and point load -- the load
                               direction resolved into transverse and axial
                               parts, then each row of the 6x1 vector with
-                              its formula and its value, then the sum
+                              its formula and its value, then the sum.
+                              A load that is NOT perpendicular to the member
+                              gets three tables: its NORMAL (bending) part,
+                              its AXIAL part, and the two added together. The
+                              element totals are given the same way, as
+                              f_eq_local NORMAL / AXIAL / TOTAL
+                           6  the same three vectors rotated to global axes
                            6  those loads rotated to global, T^T f_eq
                            7  the assembly mapping: which global DOF each of
                               the element's six DOFs lands on (this is the
@@ -725,6 +765,7 @@ TABS
                            8  after solving: q_e, q_local = T q_e, the end
                               forces F = K_hat q_e - F_eq, and F_local = T F
                               broken out as axial, shear and moment
+                           9  the axial strain, with bending ignored
                          Steps 1-7 are filled in as soon as the element
                          exists; step 8 appears once you solve. The matrices
                          are printed with a common factor pulled out, the

@@ -20,25 +20,17 @@ DOFS = ["u_i", "v_i", "th_i", "u_j", "v_j", "th_j"]
 WIDTH = 78
 
 # Formula text for each row of the equivalent nodal load vector, per load type
-FORMULAS = {
-    "UDL": ["p_ax L / 2",
-            "w_t L / 2",
-            "w_t L^2 / 12",
-            "p_ax L / 2",
-            "w_t L / 2",
-            "-w_t L^2 / 12"],
-    "LVL": ["L (2 p1 + p2) / 6",
-            "L (7 w1 + 3 w2) / 20",
-            "L^2 (w1/20 + w2/30)",
-            "L (p1 + 2 p2) / 6",
-            "L (3 w1 + 7 w2) / 20",
-            "-L^2 (w1/30 + w2/20)"],
-    "PL": ["P_ax b / L",
-           "P_t b^2 (3a + b) / L^3",
-           "P_t a b^2 / L^2",
-           "P_ax a / L",
-           "P_t a^2 (a + 3b) / L^3",
-           "-P_t a^2 b / L^2"],
+FORMULAS_NORMAL = {
+    "UDL": ["0", "w_t L / 2", "w_t L^2 / 12", "0", "w_t L / 2", "-w_t L^2 / 12"],
+    "LVL": ["0", "L (7 w1 + 3 w2) / 20", "L^2 (w1/20 + w2/30)",
+            "0", "L (3 w1 + 7 w2) / 20", "-L^2 (w1/30 + w2/20)"],
+    "PL": ["0", "P_t b^2 (3a + b) / L^3", "P_t a b^2 / L^2",
+           "0", "P_t a^2 (a + 3b) / L^3", "-P_t a^2 b / L^2"],
+}
+FORMULAS_AXIAL = {
+    "UDL": ["p_ax L / 2", "0", "0", "p_ax L / 2", "0", "0"],
+    "LVL": ["L (2 p1 + p2) / 6", "0", "0", "L (p1 + 2 p2) / 6", "0", "0"],
+    "PL": ["P_ax b / L", "0", "0", "P_ax a / L", "0", "0"],
 }
 
 
@@ -92,13 +84,16 @@ def matrix_lines(M, name, rows=None, cols=None, dec=4, colw=12):
     return out
 
 
-def vector_lines(v, name, rows=DOFS, dec=4, colw=14, rows2=None):
+def vector_lines(v, name, rows=DOFS, dec=4, colw=14, rows2=None, exp=None):
     """
     Vector with a common factor pulled out. `rows2` adds a second label
     column, used to show the global DOF name each row assembles into.
+    `exp` forces the factor, so a set of related vectors can share one and be
+    compared row against row.
     """
     v = np.asarray(v, dtype=float).reshape(-1)
-    exp = _common_exp(v)
+    if exp is None:
+        exp = _common_exp(v)
     factor = 10.0 ** exp
     head = f"{name} ="
     if exp:
@@ -219,12 +214,22 @@ def element_report(el, struct=None, result=None, title=None, style="uvt"):
             out += _term_lines(el, t, k)
 
         out.append("")
-        out.append("   Sum of all the above:")
+        out.append("   Sum of all the above, kept split into the two effects:")
         out.append("")
         gl = ([struct.dof_labels(style)[g] for g in struct.element_dofs(el)]
               if struct is not None else None)
-        out += ["   " + ln for ln in vector_lines(el.f_eq_local(), "f_eq_local",
-                                                  rows2=gl)]
+        f_n, f_a = el.f_eq_parts_local()
+        # one shared factor across the three, so the rows line up
+        ex = _common_exp(np.vstack([f_n, f_a, el.f_eq_local()]))
+        out += ["   " + ln for ln in vector_lines(f_n, "f_eq_local  NORMAL part",
+                                                  rows2=gl, exp=ex)]
+        out.append("")
+        out += ["   " + ln for ln in vector_lines(f_a, "f_eq_local  AXIAL part",
+                                                  rows2=gl, exp=ex)]
+        out.append("")
+        out += ["   " + ln for ln in vector_lines(el.f_eq_local(),
+                                                  "f_eq_local  TOTAL", rows2=gl,
+                                                  exp=ex)]
 
     # ---------------------------------------------------------------- 6
     out += step(6, "EQUIVALENT NODAL LOADS IN GLOBAL AXES  F_eq = T^T f_eq_local")
@@ -233,8 +238,17 @@ def element_report(el, struct=None, result=None, title=None, style="uvt"):
     out.append("")
     gl = ([struct.dof_labels(style)[g] for g in struct.element_dofs(el)]
           if struct is not None else None)
-    out += ["   " + ln for ln in vector_lines(el.f_eq_global(), "F_eq_global",
-                                              rows2=gl)]
+    Fn, Fa = el.f_eq_parts_global()
+    ex = _common_exp(np.vstack([Fn, Fa, el.f_eq_global()]))
+    if np.any(Fa):
+        out += ["   " + ln for ln in vector_lines(Fn, "F_eq_global  NORMAL part",
+                                                  rows2=gl, exp=ex)]
+        out.append("")
+        out += ["   " + ln for ln in vector_lines(Fa, "F_eq_global  AXIAL part",
+                                                  rows2=gl, exp=ex)]
+        out.append("")
+    out += ["   " + ln for ln in vector_lines(el.f_eq_global(),
+                                              "F_eq_global  TOTAL", rows2=gl, exp=ex)]
 
     # ---------------------------------------------------------------- 7
     out += step(7, "ASSEMBLY  --  where this element goes in KG and QG")
@@ -308,6 +322,41 @@ def element_report(el, struct=None, result=None, title=None, style="uvt"):
         if el.release_j:
             out.append(f"      (node j end is hinged, so M_j = {f[5]:.3e} Nm, i.e. zero)")
 
+    # ---------------------------------------------------------------- 9
+    out += step(9, "AXIAL STRAIN  --  bending ignored")
+    if struct is None or result is None:
+        out.append("   Press SOLVE STRUCTURE to fill this in.")
+    else:
+        st = el.axial_state(result["q"][struct.element_dofs(el), :])
+        ql = (el.T() @ result["q"][struct.element_dofs(el), :]).ravel()
+        out.append("   The axial DOFs are uncoupled from the bending ones in K_local,")
+        out.append("   so the change in length comes straight from the two local axial")
+        out.append("   displacements, with no bending contribution:")
+        out.append("")
+        out.append(f"      u_i (local) = {ql[0]: .8e} m")
+        out.append(f"      u_j (local) = {ql[3]: .8e} m")
+        out.append(f"      dL      = u_j - u_i      = {st['dL']: .8e} m")
+        out.append(f"      epsilon = dL / L         = {st['dL']: .6e} / {num(L)}")
+        out.append(f"                               = {st['eps']: .8e}")
+        out.append(f"                               = {st['eps']*1e6: .4f} microstrain")
+        out.append(f"      sigma   = E epsilon      = {st['sigma']/1e6: .4f} MPa")
+        out.append(f"      EA                       = {num(st['EA'])} N")
+        out.append("")
+        out.append("   Internal axial force, tension positive:")
+        if st["uniform"]:
+            out.append(f"      P = {st['P_i']:.2f} N, constant along the member")
+            out.append(f"      check  P / EA = {st['eps_i']: .8e}  vs  epsilon ="
+                       f" {st['eps']: .8e}")
+        else:
+            out.append(f"      P at node i end = {st['P_i']:12.2f} N   "
+                       f"(epsilon = {st['eps_i']: .6e})")
+            out.append(f"      P at node j end = {st['P_j']:12.2f} N   "
+                       f"(epsilon = {st['eps_j']: .6e})")
+            out.append("      The span loads have an axial component, so P varies")
+            out.append("      linearly along the member and the epsilon above is the")
+            out.append("      average. The mean of the two end values is"
+                       f" {(st['eps_i'] + st['eps_j'])/2: .6e}.")
+
     out.append("")
     return "\n".join(out)
 
@@ -357,11 +406,34 @@ def _term_lines(el, t, k):
         out.append(f"      p1 = {num(t['p1_ax'])} N/m, p2 = {num(t['p2_ax'])} N/m   (axial)")
     out.append("")
 
+    fn = t["f_normal"].ravel()
+    fa = t["f_axial"].ravel()
+    has_axial = bool(np.any(fa))
+
+    out.append("      NORMAL (transverse) component -- this is what bends the member")
     out.append("      local DOF      formula                        value (N or Nm)")
     out.append("      " + "-" * 64)
-    f = t["f"].ravel()
-    for i, (dof, formula) in enumerate(zip(DOFS, FORMULAS[kind])):
-        out.append(f"      f{i + 1} ({dof:<4}) = {formula:<28} = {_z(f[i]):16.4f}")
+    for i, (dof, formula) in enumerate(zip(DOFS, FORMULAS_NORMAL[kind])):
+        out.append(f"      f{i + 1} ({dof:<4}) = {formula:<28} = {_z(fn[i]):16.4f}")
+
+    if has_axial:
+        out.append("")
+        out.append("      AXIAL component -- this stretches or shortens the member")
+        out.append("      local DOF      formula                        value (N or Nm)")
+        out.append("      " + "-" * 64)
+        for i, (dof, formula) in enumerate(zip(DOFS, FORMULAS_AXIAL[kind])):
+            out.append(f"      f{i + 1} ({dof:<4}) = {formula:<28} = {_z(fa[i]):16.4f}")
+        out.append("")
+        out.append("      TOTAL for this load = normal + axial")
+        out.append("      " + "-" * 64)
+        f = t["f"].ravel()
+        for i, dof in enumerate(DOFS):
+            out.append(f"      f{i + 1} ({dof:<4})   {_z(fn[i]):14.4f} +{_z(fa[i]):14.4f}"
+                       f" ={_z(f[i]):16.4f}")
+    else:
+        out.append("")
+        out.append("      Axial component is zero -- this load is perpendicular to the")
+        out.append("      member, so it produces no axial force.")
     return out
 
 
