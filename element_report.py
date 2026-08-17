@@ -92,7 +92,11 @@ def matrix_lines(M, name, rows=None, cols=None, dec=4, colw=12):
     return out
 
 
-def vector_lines(v, name, rows=DOFS, dec=4, colw=14):
+def vector_lines(v, name, rows=DOFS, dec=4, colw=14, rows2=None):
+    """
+    Vector with a common factor pulled out. `rows2` adds a second label
+    column, used to show the global DOF name each row assembles into.
+    """
     v = np.asarray(v, dtype=float).reshape(-1)
     exp = _common_exp(v)
     factor = 10.0 ** exp
@@ -101,8 +105,11 @@ def vector_lines(v, name, rows=DOFS, dec=4, colw=14):
         head += f"  1 x 10^{exp}  x"
     out = [head]
     lw = max((len(r) for r in rows), default=0) + 1 if rows else 0
+    lw2 = max((len(r) for r in rows2), default=0) + 1 if rows2 else 0
     for i, val in enumerate(v):
         lbl = f"{rows[i]:>{lw}} " if rows else ""
+        if rows2:
+            lbl += f"{rows2[i]:>{lw2}} "
         out.append(f"{lbl} [{_z(val / factor):{colw}.{dec}f} ]")
     return out
 
@@ -115,14 +122,20 @@ def dir_name(tag):
     return LOAD_DIR_LABELS.get(tag, tag)
 
 
+def nname(nd):
+    """A node's display name, falling back to N<id> for bare engine nodes."""
+    return getattr(nd, "name", None) or f"N{nd.id}"
+
+
 # ----------------------------------------------------------------------
 # the report
 # ----------------------------------------------------------------------
-def element_report(el, struct=None, result=None, title=None):
+def element_report(el, struct=None, result=None, title=None, style="uvt"):
     """
     el:     fe_engine.Element
     struct: fe_engine.Structure it belongs to (for the assembly step)
     result: the dict from Structure.solve() (for the final step)
+    style:  DOF naming style used for the global DOF column in step 7
     """
     L = el.L
     alpha = el.alpha
@@ -131,13 +144,13 @@ def element_report(el, struct=None, result=None, title=None):
     out = []
 
     out.append("=" * WIDTH)
-    out.append(title or f"ELEMENT E{el.id}   (node {el.ni.id} -> node {el.nj.id})")
+    out.append(title or f"ELEMENT E{el.id}   ({nname(el.ni)} -> {nname(el.nj)})")
     out.append("=" * WIDTH)
 
     # ---------------------------------------------------------------- 1
     out += step(1, "GEOMETRY AND SECTION PROPERTIES")
-    out.append(f"   node i = N{el.ni.id} at ({num(el.ni.x)}, {num(el.ni.y)}) m")
-    out.append(f"   node j = N{el.nj.id} at ({num(el.nj.x)}, {num(el.nj.y)}) m")
+    out.append(f"   node i = {nname(el.ni)} at ({num(el.ni.x)}, {num(el.ni.y)}) m")
+    out.append(f"   node j = {nname(el.nj)} at ({num(el.nj.x)}, {num(el.nj.y)}) m")
     dx, dy = el.nj.x - el.ni.x, el.nj.y - el.ni.y
     out.append("")
     out.append(f"   dx = xj - xi = {num(dx)} m        dy = yj - yi = {num(dy)} m")
@@ -208,14 +221,20 @@ def element_report(el, struct=None, result=None, title=None):
         out.append("")
         out.append("   Sum of all the above:")
         out.append("")
-        out += ["   " + ln for ln in vector_lines(el.f_eq_local(), "f_eq_local")]
+        gl = ([struct.dof_labels(style)[g] for g in struct.element_dofs(el)]
+              if struct is not None else None)
+        out += ["   " + ln for ln in vector_lines(el.f_eq_local(), "f_eq_local",
+                                                  rows2=gl)]
 
     # ---------------------------------------------------------------- 6
     out += step(6, "EQUIVALENT NODAL LOADS IN GLOBAL AXES  F_eq = T^T f_eq_local")
-    out.append("   Rotated into global axes, ready to be added into the global load")
-    out.append("   vector QG at this element's DOFs.")
+    out.append("   Rotated into global axes, then added into the global load")
+    out.append("   vector Q at the DOFs named in the second column.")
     out.append("")
-    out += ["   " + ln for ln in vector_lines(el.f_eq_global(), "F_eq_global")]
+    gl = ([struct.dof_labels(style)[g] for g in struct.element_dofs(el)]
+          if struct is not None else None)
+    out += ["   " + ln for ln in vector_lines(el.f_eq_global(), "F_eq_global",
+                                              rows2=gl)]
 
     # ---------------------------------------------------------------- 7
     out += step(7, "ASSEMBLY  --  where this element goes in KG and QG")
@@ -227,17 +246,16 @@ def element_report(el, struct=None, result=None, title=None):
         out.append("   assembly matrix A written as a list: KG[dofs, dofs] += K_hat, and")
         out.append("   QG[dofs] += F_eq_global.")
         out.append("")
-        out.append("      element DOF        global DOF     belongs to")
-        out.append("      " + "-" * 56)
+        glabels = struct.dof_labels(style)
+        out.append("      element DOF     global DOF  label            belongs to")
+        out.append("      " + "-" * 68)
         for i, (name, g) in enumerate(zip(DOFS, dofs)):
-            if g < struct.n_node_dofs:
-                node_no, comp = divmod(g, 3)
-                nid = struct.nodes[node_no].id
-                who = f"node N{nid}, {'Fx Fy M'.split()[comp]}"
-            else:
+            who, _nd = struct.dof_owner(g)
+            if g >= struct.n_node_dofs:
                 end = "i" if i < 3 else "j"
-                who = f"THIS MEMBER ONLY (hinge at node {end})"
-            out.append(f"      {name:<8} ({i})  ->   {g:>5}          {who}")
+                who = f"this member only (hinge at node {end})"
+            out.append(f"      {name:<8} ({i})  ->  {g:>5}      "
+                       f"{glabels[g]:<16} {who}")
         if el.release_i or el.release_j:
             out.append("")
             out.append("   A released end keeps the joint's two TRANSLATION DOFs, so the")
@@ -254,25 +272,31 @@ def element_report(el, struct=None, result=None, title=None):
         ql = el.T() @ qe
         Fg = el.K_global() @ qe - el.f_eq_global()
         Fl = el.T() @ Fg
-        out.append("   Taken from the solved global displacement vector q:")
+        glabels = struct.dof_labels(style)
+        gl = [glabels[g] for g in dofs]
+        out.append("   The second label column is the GLOBAL DOF each row belongs")
+        out.append("   to, so these vectors can be read straight against Q and KG.")
         out.append("")
         out += ["   " + ln for ln in vector_lines(qe, "q_e (global axes, m and rad)",
-                                                  DOFS, dec=8)]
+                                                  DOFS, dec=8, rows2=gl)]
         out.append("")
-        out.append("   Rotated into the member's own axes,  q_local = T q_e :")
+        out.append("   Rotated into the member's own axes,  q_local = T q_e")
+        out.append("   (values are along the member now, but each row is still the")
+        out.append("   same DOF):")
         out.append("")
-        out += ["   " + ln for ln in vector_lines(ql, "q_local", DOFS, dec=8)]
+        out += ["   " + ln for ln in vector_lines(ql, "q_local", DOFS, dec=8, rows2=gl)]
         out.append("")
         out.append("   End forces in global axes,  F = K_hat q_e - F_eq_global :")
         out.append("")
-        out += ["   " + ln for ln in vector_lines(Fg, "F_global", DOFS)]
+        out += ["   " + ln for ln in vector_lines(Fg, "F_global", DOFS, rows2=gl)]
         out.append("")
         out.append("   End forces in local axes,  F_local = T F  --  these are the")
         out.append("   axial force, shear and bending moment at each end:")
         out.append("")
         out += ["   " + ln for ln in vector_lines(Fl, "F_local",
                                                   ["N_i", "V_i", "M_i",
-                                                   "N_j", "V_j", "M_j"])]
+                                                   "N_j", "V_j", "M_j"],
+                                                  rows2=gl)]
         f = Fl.ravel()
         out.append("")
         out.append(f"      End i:  axial N = {f[0]:12.2f} N   shear V = {f[1]:12.2f} N"
@@ -339,6 +363,100 @@ def _term_lines(el, t, k):
     for i, (dof, formula) in enumerate(zip(DOFS, FORMULAS[kind])):
         out.append(f"      f{i + 1} ({dof:<4}) = {formula:<28} = {_z(f[i]):16.4f}")
     return out
+
+
+def global_report(struct, result=None, style="uvt"):
+    """
+    The assembled global system: the DOF map, the Q vector broken into its
+    nodal and equivalent-load parts, KG, and the reduced free-DOF system that
+    is actually solved.
+    """
+    labels = struct.dof_labels(style)
+    n = struct.ndof
+    restrained = set(struct.restrained_global_dofs())
+    free = [i for i in range(n) if i not in restrained]
+    colw = 12 if n <= 8 else 10
+    out = []
+
+    out.append("=" * WIDTH)
+    out.append("GLOBAL SYSTEM  --  assembled KG and Q")
+    out.append("=" * WIDTH)
+
+    # ------------------------------------------------------------------
+    out += step(1, "GLOBAL DOF NUMBERING  --  the order of the Q vector")
+    out.append("   Node order sets this. Reorder the nodes (Move Up / Move Down")
+    out.append("   in the Nodes list) to change it, and rename nodes to change")
+    out.append("   the labels.")
+    out.append("")
+    out.append("      dof   label            belongs to                       status")
+    out.append("      " + "-" * 68)
+    for i in range(n):
+        who, _nd = struct.dof_owner(i)
+        state = "RESTRAINED" if i in restrained else "free"
+        out.append(f"      {i:>3}   {labels[i]:<16} {who:<32} {state}")
+
+    # ------------------------------------------------------------------
+    out += step(2, "GLOBAL LOAD VECTOR  Q")
+    q_nodal = np.zeros((n, 1))
+    for k, nd in enumerate(struct.nodes):
+        q_nodal[3*k:3*k + 3, 0] = nd.loads
+    _KG, QG = struct.assemble()
+    q_eq = QG - q_nodal
+    out.append("   Q = loads applied directly at the nodes")
+    out.append("       + the equivalent nodal loads from every element's span loads")
+    out.append("")
+    head = f"      {'dof':<4}{'label':<16}{'nodal':>16}{'equivalent':>16}{'total Q':>16}"
+    out.append(head)
+    out.append("      " + "-" * (len(head) - 6))
+    for i in range(n):
+        out.append(f"      {i:<4}{labels[i]:<16}{_z(q_nodal[i, 0]):16.4f}"
+                   f"{_z(q_eq[i, 0]):16.4f}{_z(QG[i, 0]):16.4f}")
+
+    # ------------------------------------------------------------------
+    out += step(3, "GLOBAL STIFFNESS MATRIX  KG")
+    out.append("   Every element's K_hat added into the rows and columns of its")
+    out.append("   own DOFs.")
+    out.append("")
+    out += ["   " + ln for ln in matrix_lines(_KG, "KG", labels, labels, colw=colw)]
+
+    # ------------------------------------------------------------------
+    out += step(4, "REDUCED SYSTEM  --  free DOFs only")
+    if not free:
+        out.append("   Every DOF is restrained; there is nothing to solve.")
+    else:
+        out.append("   Restrained DOFs have zero displacement, so their rows and")
+        out.append("   columns drop out. This reduced system is what the lab scripts")
+        out.append("   assemble directly, and what gets solved:")
+        out.append("")
+        out.append("      free DOFs: " + ", ".join(f"{labels[i]} ({i})" for i in free))
+        out.append("")
+        flab = [labels[i] for i in free]
+        Kff = _KG[np.ix_(free, free)]
+        Qf = QG[free, :]
+        out += ["   " + ln for ln in matrix_lines(Kff, "K_ff", flab, flab, colw=colw)]
+        out.append("")
+        out += ["   " + ln for ln in vector_lines(Qf, "Q_f", flab)]
+        out.append("")
+        out.append("   solve  K_ff q_f = Q_f  for the free displacements q_f")
+
+    # ------------------------------------------------------------------
+    out += step(5, "SOLUTION")
+    if result is None:
+        out.append("   Press SOLVE STRUCTURE to fill this in.")
+    else:
+        out += ["   " + ln for ln in vector_lines(result["q"], "q (m and rad)",
+                                                  labels, dec=8)]
+        out.append("")
+        out.append("   Reactions, from  R = KG q - Q  at the restrained DOFs:")
+        out.append("")
+        rl = [labels[i] for i in sorted(restrained)]
+        if rl:
+            out += ["   " + ln for ln in
+                    vector_lines(result["R"][sorted(restrained), :], "R", rl)]
+        else:
+            out.append("      (no restrained DOFs)")
+    out.append("")
+    return "\n".join(out)
 
 
 def full_report(struct, elements, result=None, header=None):

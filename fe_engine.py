@@ -35,31 +35,67 @@ LOAD_DIR_LABELS = {"local": "Perp. to member",
 
 
 class Node:
-    def __init__(self, id_, x, y, support="Free", roller_axis="Y"):
+    def __init__(self, id_, x, y, support="Free", roller_axis="Y",
+                 restrain_rotation=None, name=None):
         """
-        support: "Free", "Pinned", "Roller", "Fixed"
+        support: "Free", "Pinned", "Roller", "Fixed" -- this fixes only which
+                 TRANSLATIONS are restrained.
         roller_axis: only used when support == "Roller". "Y" restrains global Y
                      translation (roller rolls horizontally, the usual case);
                      "X" restrains global X translation (roller on a vertical
                      face, rolls up and down).
+        restrain_rotation: whether the node's rotation is held, chosen
+                     independently of the translations. None means "use the
+                     usual default for this support type": held for Fixed,
+                     free for everything else. Setting it True on a roller
+                     gives a guided (sliding) support, which slides along one
+                     axis but cannot rotate and so carries a reaction moment.
+                     Setting it True on a Free node restrains rotation alone,
+                     which is what a line of symmetry needs.
         """
         self.id = id_
         self.x = x
         self.y = y
         self.support = support
         self.roller_axis = roller_axis
+        self.restrain_rotation = restrain_rotation
+        # display name; the node's position in Structure.nodes is what sets
+        # its place in the global DOF numbering, not this name or the id
+        self.name = name or f"N{id_}"
+        # optional hand-written names for this node's three DOFs, e.g.
+        # ["q1", "q2", "q3"]. Blank entries fall back to the generated label.
+        self.dof_names = ["", "", ""]
         self.loads = [0.0, 0.0, 0.0]  # Fx, Fy, M applied at this node
+
+    def restrained_translations(self):
+        """(x_held, y_held) implied by the support type."""
+        if self.support in ("Fixed", "Pinned"):
+            return True, True
+        if self.support == "Roller":
+            if str(self.roller_axis).upper().startswith("X"):
+                return True, False
+            return False, True
+        return False, False
+
+    def rotation_held(self):
+        if self.restrain_rotation is None:
+            return self.support == "Fixed"
+        return bool(self.restrain_rotation)
 
     def restrained_dofs(self):
         """Return which local dof indices (0=u,1=v,2=theta) are restrained."""
-        if self.support == "Fixed":
-            return [0, 1, 2]
-        elif self.support in ("Pinned",):
-            return [0, 1]
-        elif self.support == "Roller":
-            # Restrains translation along the chosen global axis only
-            return [0] if str(self.roller_axis).upper().startswith("X") else [1]
-        return []
+        tx, ty = self.restrained_translations()
+        dofs = []
+        if tx:
+            dofs.append(0)
+        if ty:
+            dofs.append(1)
+        if self.rotation_held():
+            dofs.append(2)
+        return dofs
+
+    def is_supported(self):
+        return bool(self.restrained_dofs())
 
 
 class Element:
@@ -98,6 +134,9 @@ class Element:
         self.lvl_dir = lvl_dir
         self.release_i = bool(release_i)
         self.release_j = bool(release_j)
+        # optional hand-written names for the extra rotation DOFs that a
+        # released end gets, [name for the i end, name for the j end]
+        self.release_names = ["", ""]
         self.point_loads = [self._norm_point_load(p) for p in (point_loads or [])]
 
     @staticmethod
@@ -419,6 +458,68 @@ class Structure:
                 nxt += 1
             self._elem_dofs.append(di + dj)
         self.ndof = nxt
+
+    def dof_labels(self, style="uvt"):
+        """
+        A name for every global DOF, in the order they appear in KG and Q.
+
+        The ORDER is set by the order of Structure.nodes: node k owns global
+        DOFs 3k, 3k+1, 3k+2. Reorder that list and the Q vector reorders with
+        it, which is how you make the assembly match a hand worked one.
+
+        style: "uvt"    -> u_A, v_A, th_A, u_B, ...
+               "FxFyM"  -> Fx_A, Fy_A, M_A, ...
+               "q"      -> q1, q2, q3, ... straight down the vector
+
+        A hand-written name set on a node (Node.dof_names) or on a released
+        member end (Element.release_names) overrides the generated label for
+        that DOF, so the vectors can be annotated "this is q1, this is q2"
+        exactly as they were numbered by hand. The names travel with the node,
+        so reordering the nodes moves each name to its new row rather than
+        leaving it attached to a row number.
+        """
+        n = self.ndof
+        comps = {"uvt": ("u", "v", "th"),
+                 "FxFyM": ("Fx", "Fy", "M")}.get(style, ("u", "v", "th"))
+
+        if style == "q":
+            labels = [f"q{i + 1}" for i in range(n)]
+        else:
+            labels = [f"dof{i}" for i in range(n)]
+            for i, nd in enumerate(self.nodes):
+                nm = getattr(nd, "name", None) or f"N{nd.id}"
+                for c in range(3):
+                    labels[3*i + c] = f"{comps[c]}_{nm}"
+            # extra rotation DOFs handed to released member ends
+            for (k, end), dof in self.release_dofs.items():
+                el = self.elements[k]
+                labels[dof] = f"{comps[2]}_E{el.id}{end}"
+
+        # hand-written names win over anything generated
+        for i, nd in enumerate(self.nodes):
+            custom = getattr(nd, "dof_names", None) or ["", "", ""]
+            for c in range(3):
+                if str(custom[c]).strip():
+                    labels[3*i + c] = str(custom[c]).strip()
+        for (k, end), dof in self.release_dofs.items():
+            names = getattr(self.elements[k], "release_names", None) or ["", ""]
+            nm = str(names[0 if end == "i" else 1]).strip()
+            if nm:
+                labels[dof] = nm
+        return labels
+
+    def dof_owner(self, dof):
+        """(description, node or None) for one global DOF."""
+        if dof < self.n_node_dofs:
+            k, comp = divmod(dof, 3)
+            nd = self.nodes[k]
+            nm = getattr(nd, "name", None) or f"N{nd.id}"
+            return f"node {nm}, {('Fx', 'Fy', 'M')[comp]}", nd
+        for (k, end), d in self.release_dofs.items():
+            if d == dof:
+                el = self.elements[k]
+                return f"element E{el.id}, hinged {end} end rotation", None
+        return "?", None
 
     def element_dofs(self, el):
         for k, e in enumerate(self.elements):

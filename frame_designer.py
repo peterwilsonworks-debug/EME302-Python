@@ -25,7 +25,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from fe_engine import Node, Element, Structure, LOAD_DIRS, LOAD_DIR_LABELS
-from element_report import element_report
+from element_report import element_report, global_report
 
 # Support types as shown in the UI. The two roller entries map onto the
 # engine's ("Roller", roller_axis) pair.
@@ -42,6 +42,13 @@ def dir_label(tag):
 
 def dir_tag(label):
     return LABEL_TO_DIR.get(label, "local")
+
+
+# How the global DOFs are named in the matrices and reports
+DOF_STYLE_LABELS = {"uvt": "u / v / th",
+                    "FxFyM": "Fx / Fy / M",
+                    "q": "q1, q2, q3 ..."}
+LABEL_TO_DOF_STYLE = {v: k for k, v in DOF_STYLE_LABELS.items()}
 GRID_SNAP = 0.25  # metres, snap tolerance when clicking
 DEFAULT_VIEW_HALF_RANGE = 10.0  # metres; fixed canvas view, does not autoscale
 DEFORMED_NPTS = 41  # samples per member when drawing the deflected curve
@@ -62,21 +69,54 @@ def split_support(ui_support):
 class NodeItem:
     _next_id = 0
 
-    def __init__(self, x, y):
+    def __init__(self, x, y, name=None):
         self.id = NodeItem._next_id
         NodeItem._next_id += 1
         self.x = x
         self.y = y
-        self.support = "Free"   # one of SUPPORT_TYPES
+        # Display name only. A node's place in the global Q vector comes from
+        # its position in the Nodes list, not from this or from the id.
+        self.name = name or f"N{self.id}"
+        # hand-written names for this node's three DOFs; blank = generated
+        self.dof_names = ["", "", ""]
+        self.support = "Free"          # one of SUPPORT_TYPES (translations)
+        self.restrain_rotation = False  # chosen independently of the above
         self.Fx = 0.0
         self.Fy = 0.0
         self.M = 0.0
 
     def label(self):
-        return f"N{self.id}"
+        return self.name
+
+    def restraints(self):
+        """(x_held, y_held, rotation_held) actually applied at this node."""
+        if self.support in ("Fixed", "Pinned"):
+            tx, ty = True, True
+        elif self.support == "Roller-X":
+            tx, ty = True, False
+        elif self.support == "Roller-Y":
+            tx, ty = False, True
+        else:
+            tx, ty = False, False
+        return tx, ty, bool(self.restrain_rotation)
+
+    def is_supported(self):
+        return any(self.restraints())
+
+    def support_text(self):
+        """Short description for lists, e.g. 'Roller-Y, no rot'."""
+        tx, ty, rot = self.restraints()
+        if tx and ty and rot:
+            return "Fixed"
+        if not (tx or ty):
+            return "Rotation only" if rot else "Free"
+        return self.support + (", no rot" if rot else "")
 
     def to_dict(self):
-        return {"x": self.x, "y": self.y, "support": self.support,
+        return {"x": self.x, "y": self.y, "name": self.name,
+                "dof_names": list(self.dof_names),
+                "support": self.support,
+                "restrain_rotation": self.restrain_rotation,
                 "Fx": self.Fx, "Fy": self.Fy, "M": self.M}
 
 
@@ -98,10 +138,12 @@ class ElementItem:
         self.lvl_dir = "local"
         self.release_i = False  # hinge at the node i end (no moment carried)
         self.release_j = False  # hinge at the node j end
+        # hand-written names for the extra rotation DOFs a hinged end gets
+        self.release_names = ["", ""]
         self.point_loads = []   # list of [P, a, dir]  (P in N, a in m from node i)
 
     def label(self):
-        return f"E{self.id}: N{self.ni.id}-N{self.nj.id}"
+        return f"E{self.id}: {self.ni.label()}-{self.nj.label()}"
 
     def length(self):
         return np.hypot(self.nj.x - self.ni.x, self.nj.y - self.ni.y)
@@ -122,6 +164,7 @@ class ElementItem:
                 "udl": self.udl, "w1": self.w1, "w2": self.w2,
                 "udl_dir": self.udl_dir, "lvl_dir": self.lvl_dir,
                 "release_i": self.release_i, "release_j": self.release_j,
+                "release_names": list(self.release_names),
                 "point_loads": [[float(p[0]), float(p[1]),
                                  p[2] if len(p) > 2 else "local"]
                                 for p in self.point_loads]}
@@ -241,11 +284,19 @@ class FrameDesignerPanel(ttk.Frame):
 
         self.tab_props = ttk.Frame(self.tabs)
         self.tab_results = ttk.Frame(self.tabs)
+        self.tab_dofs = ttk.Frame(self.tabs)
+        self.tab_global = ttk.Frame(self.tabs)
         self.tabs.add(self.tab_props, text="Properties")
         self.tabs.add(self.tab_results, text="Results")
+        self.tabs.add(self.tab_dofs, text="DOF Names")
+        self.tabs.add(self.tab_global, text="Global Q / KG")
 
         self._build_props_tab()
         self._build_results_tab()
+        self._build_dof_tab()
+        self.global_text, _ = self._make_scrolled_text(self.tab_global)
+        self._set_text(self.global_text,
+                       "Add some elements to see the assembled global system.")
 
     def _build_props_tab(self):
         # Wrap all Properties-tab content in a scrollable canvas, since the
@@ -295,11 +346,23 @@ class FrameDesignerPanel(ttk.Frame):
         scroll_canvas.bind("<Enter>", _bind_wheel)
         scroll_canvas.bind("<Leave>", _unbind_wheel)
 
-        lst_frame = ttk.LabelFrame(frame, text="Nodes")
+        lst_frame = ttk.LabelFrame(frame, text="Nodes  (this order is the order of Q)")
         lst_frame.pack(fill="both", padx=6, pady=4)
         self.node_list = tk.Listbox(lst_frame, height=6)
         self.node_list.pack(fill="x", padx=4, pady=4)
         self.node_list.bind("<<ListboxSelect>>", self._on_node_list_select)
+        order_bar = ttk.Frame(lst_frame)
+        order_bar.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Button(order_bar, text="Move Up",
+                   command=lambda: self._move_node(-1)).pack(side="left")
+        ttk.Button(order_bar, text="Move Down",
+                   command=lambda: self._move_node(1)).pack(side="left", padx=4)
+        ttk.Label(order_bar, text="   DOF labels:").pack(side="left")
+        self.dof_style = tk.StringVar(value=DOF_STYLE_LABELS["uvt"])
+        cb = ttk.Combobox(order_bar, textvariable=self.dof_style, state="readonly",
+                          width=14, values=list(DOF_STYLE_LABELS.values()))
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_reports())
 
         elem_frame = ttk.LabelFrame(frame, text="Elements")
         elem_frame.pack(fill="both", padx=6, pady=4)
@@ -324,6 +387,20 @@ class FrameDesignerPanel(ttk.Frame):
         self.n_coord_lbl.grid(row=row, column=0, columnspan=2, sticky="w", padx=4, pady=2)
         row += 1
 
+        ttk.Label(parent, text="Name:").grid(row=row, column=0, sticky="w", padx=4)
+        self.n_name = tk.StringVar(value="")
+        ttk.Entry(parent, textvariable=self.n_name, width=14).grid(
+            row=row, column=1, padx=4, pady=2)
+        row += 1
+        ttk.Label(parent,
+                  text="(Used everywhere this node is shown, and in\n"
+                       " the global DOF labels u_<name>, v_<name>,\n"
+                       " th_<name>. The node's POSITION in the Nodes\n"
+                       " list, not its name, sets where it sits in Q.)",
+                  font=("TkDefaultFont", 7), foreground="gray").grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=4)
+        row += 1
+
         ttk.Label(parent, text="X (m):").grid(row=row, column=0, sticky="w", padx=4)
         self.n_x = tk.StringVar(value="0")
         ttk.Entry(parent, textvariable=self.n_x, width=14).grid(row=row, column=1, padx=4, pady=2)
@@ -339,11 +416,31 @@ class FrameDesignerPanel(ttk.Frame):
         cb = ttk.Combobox(parent, textvariable=self.n_support, values=SUPPORT_TYPES,
                           state="readonly", width=10)
         cb.grid(row=row, column=1, sticky="w", padx=4, pady=2)
+        cb.bind("<<ComboboxSelected>>", self._on_support_changed)
         row += 1
         ttk.Label(parent,
-                  text="(Roller-Y restrains global Y — rolls\n"
+                  text="(Chooses which TRANSLATIONS are held.\n"
+                       " Roller-Y restrains global Y -- rolls\n"
                        " horizontally.  Roller-X restrains global\n"
-                       " X — rolls vertically.)",
+                       " X -- rolls vertically.)",
+                  font=("TkDefaultFont", 7), foreground="gray").grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=4)
+        row += 1
+
+        self.n_rot = tk.BooleanVar(value=False)
+        self.n_rot_check = ttk.Checkbutton(
+            parent, text="Restrain rotation at this node", variable=self.n_rot)
+        self.n_rot_check.grid(row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 0))
+        row += 1
+        ttk.Label(parent,
+                  text="(Rotation is chosen separately from the\n"
+                       " translations. Leave it clear for an ordinary\n"
+                       " pinned or roller support. Tick it on a roller\n"
+                       " to get a GUIDED support: it still slides along\n"
+                       " its free axis but cannot rotate, so it carries\n"
+                       " a reaction moment. Tick it on a Free node to\n"
+                       " restrain rotation alone -- a symmetry line.\n"
+                       " Fixed always holds rotation.)",
                   font=("TkDefaultFont", 7), foreground="gray").grid(
             row=row, column=0, columnspan=2, sticky="w", padx=4)
         row += 1
@@ -581,6 +678,164 @@ class FrameDesignerPanel(ttk.Frame):
         widget.configure(state="disabled")
 
     # ------------------------------------------------------------------
+    # DOF naming
+    # ------------------------------------------------------------------
+    def _build_dof_tab(self):
+        frame = self.tab_dofs
+        ttk.Label(frame, wraplength=560, justify="left",
+                  text="Name each degree of freedom yourself. Whatever you type here is "
+                       "printed next to that row in the Q vector, KG, the reduced K_ff / "
+                       "Q_f, the reactions, and next to the local and global force "
+                       "vectors on every element tab.\n\n"
+                       "Leave a box empty to fall back to the generated label. Names "
+                       "belong to the node, so reordering the nodes carries each name to "
+                       "its new row.").pack(fill="x", padx=8, pady=(8, 4))
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x", padx=8)
+        ttk.Button(btns, text="Number the FREE DOFs q1, q2, ...",
+                   command=lambda: self._autofill_dofs(free_only=True)).pack(side="left")
+        ttk.Button(btns, text="Number ALL DOFs q1, q2, ...",
+                   command=lambda: self._autofill_dofs(free_only=False)).pack(side="left",
+                                                                              padx=4)
+        ttk.Button(btns, text="Clear all",
+                   command=self._clear_dof_names).pack(side="left")
+        ttk.Label(frame, wraplength=560, justify="left", foreground="gray",
+                  font=("TkDefaultFont", 8),
+                  text="'Number the FREE DOFs' matches the lab worksheets: the restrained "
+                       "DOFs drop out of the reduced system, so only the ones that survive "
+                       "into the displacement vector get a q number.").pack(
+            fill="x", padx=8, pady=(2, 6))
+
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True, padx=8)
+        self.dof_canvas = tk.Canvas(body, highlightthickness=0)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=self.dof_canvas.yview)
+        self.dof_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.dof_canvas.pack(side="left", fill="both", expand=True)
+        self.dof_inner = ttk.Frame(self.dof_canvas)
+        self.dof_canvas.create_window((0, 0), window=self.dof_inner, anchor="nw")
+        self.dof_inner.bind(
+            "<Configure>",
+            lambda e: self.dof_canvas.configure(scrollregion=self.dof_canvas.bbox("all")))
+        self.dof_canvas.bind(
+            "<Enter>",
+            lambda e: self.dof_canvas.bind_all(
+                "<MouseWheel>",
+                lambda ev: self.dof_canvas.yview_scroll(int(-ev.delta / 120), "units")))
+        self.dof_canvas.bind("<Leave>",
+                             lambda e: self.dof_canvas.unbind_all("<MouseWheel>"))
+
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", padx=8, pady=8)
+        ttk.Button(bar, text="Apply names", command=self._apply_dof_names).pack(
+            side="left", fill="x", expand=True)
+
+        self.dof_rows = []        # list of (owner, slot, StringVar)
+        self.dof_signature = None
+
+    def _dof_signature(self, struct):
+        """What the table depends on: which DOFs exist and who owns them."""
+        if struct is None:
+            return None
+        return (tuple(id(n) for n in self.nodes),
+                tuple(sorted(struct.release_dofs.values())),
+                struct.ndof)
+
+    def _sync_dof_tab(self, struct):
+        """Rebuild the name table only when the set of DOFs actually changes."""
+        sig = self._dof_signature(struct)
+        if sig == self.dof_signature:
+            return
+        self.dof_signature = sig
+        for w in self.dof_inner.winfo_children():
+            w.destroy()
+        self.dof_rows = []
+        if struct is None:
+            ttk.Label(self.dof_inner,
+                      text="Add some elements first.").grid(row=0, column=0, padx=4, pady=4)
+            return
+
+        auto = struct.dof_labels(self.dof_style_tag())
+        restrained = set(struct.restrained_global_dofs())
+        for col, head in enumerate(["Q row", "belongs to", "status", "your name"]):
+            ttk.Label(self.dof_inner, text=head,
+                      font=("TkDefaultFont", 9, "bold")).grid(
+                row=0, column=col, padx=4, pady=3, sticky="w")
+
+        # map each global DOF back to the GUI object that stores its name
+        owner_of = {}
+        for k, n in enumerate(self.nodes):
+            for c in range(3):
+                owner_of[3*k + c] = (n, c)
+        for (k, end), dof in struct.release_dofs.items():
+            owner_of[dof] = (self.elements[k], 3 + (0 if end == "i" else 1))
+
+        for dof in range(struct.ndof):
+            who, _nd = struct.dof_owner(dof)
+            state = "restrained" if dof in restrained else "free"
+            ttk.Label(self.dof_inner, text=str(dof)).grid(
+                row=dof + 1, column=0, padx=4, sticky="w")
+            ttk.Label(self.dof_inner, text=who).grid(
+                row=dof + 1, column=1, padx=4, sticky="w")
+            ttk.Label(self.dof_inner, text=state,
+                      foreground="gray" if state == "free" else "firebrick").grid(
+                row=dof + 1, column=2, padx=4, sticky="w")
+            owner, slot = owner_of[dof]
+            current = (owner.dof_names[slot] if slot < 3
+                       else owner.release_names[slot - 3])
+            var = tk.StringVar(value=current)
+            ent = ttk.Entry(self.dof_inner, textvariable=var, width=12)
+            ent.grid(row=dof + 1, column=3, padx=4, pady=1)
+            ent.bind("<Return>", lambda e: self._apply_dof_names())
+            ttk.Label(self.dof_inner, text=f"(else {auto[dof]})",
+                      foreground="gray", font=("TkDefaultFont", 8)).grid(
+                row=dof + 1, column=4, padx=4, sticky="w")
+            self.dof_rows.append((owner, slot, var))
+
+    def _autofill_dofs(self, free_only):
+        struct, _mapping, _result = self._report_context()
+        if struct is None:
+            return
+        restrained = set(struct.restrained_global_dofs())
+        k = 0
+        for dof, (_owner, _slot, var) in enumerate(self.dof_rows):
+            if free_only and dof in restrained:
+                var.set("")
+                continue
+            k += 1
+            var.set(f"q{k}")
+        self._apply_dof_names()
+
+    def _clear_dof_names(self):
+        for _owner, _slot, var in self.dof_rows:
+            var.set("")
+        self._apply_dof_names()
+
+    def _apply_dof_names(self):
+        for owner, slot, var in self.dof_rows:
+            name = var.get().strip()
+            if slot < 3:
+                owner.dof_names[slot] = name
+            else:
+                owner.release_names[slot - 3] = name
+        # A solved model keeps its own copy of the engine objects, built when
+        # SOLVE was pressed. Names are labels only and change no numbers, so
+        # push them straight across rather than forcing a re-solve.
+        if self.struct is not None:
+            for item, fen in zip(self.nodes, self.struct.nodes):
+                fen.dof_names = list(item.dof_names)
+            for item, fee in self.fe_elements.items():
+                fee.release_names = list(item.release_names)
+        self._refresh_reports()
+        self._display_results_if_solved()
+
+    def _display_results_if_solved(self):
+        if self.result is not None and self.struct is not None:
+            self._display_results()
+
+    # ------------------------------------------------------------------
     # Per-element "working" tabs
     # ------------------------------------------------------------------
     def _sync_element_tabs(self):
@@ -603,9 +858,24 @@ class FrameDesignerPanel(ttk.Frame):
                 self.tabs.add(frame, text=f" E{e.id} ")
                 self.elem_tabs[e] = (frame, txt)
 
+        struct, mapping, result = self._report_context()
+        style = self.dof_style_tag()
+        self._sync_dof_tab(struct)
+
+        # the assembled global system
+        if struct is None:
+            self._set_text(self.global_text,
+                           "Add some elements to see the assembled global system.")
+        else:
+            try:
+                self._set_text(self.global_text,
+                               global_report(struct, result, style))
+            except Exception as ex:
+                self._set_text(self.global_text,
+                               f"Could not assemble the global system:\n{ex}")
+
         if not self.elem_tabs:
             return
-        struct, mapping, result = self._report_context()
         for e, (_frame, txt) in self.elem_tabs.items():
             fee = mapping.get(e)
             if fee is None:
@@ -613,7 +883,7 @@ class FrameDesignerPanel(ttk.Frame):
                                     "two nodes are not at the same point.")
                 continue
             try:
-                self._set_text(txt, element_report(fee, struct, result))
+                self._set_text(txt, element_report(fee, struct, result, style=style))
             except Exception as ex:      # never let a display error kill an edit
                 self._set_text(txt, f"Could not produce the working for {e.label()}:\n{ex}")
 
@@ -631,8 +901,10 @@ class FrameDesignerPanel(ttk.Frame):
         struct, mapping, result = self._report_context()
         header = ["=" * 78, "FRAME ANALYSIS REPORT", "=" * 78, "",
                   self.results_as_text(), ""]
-        body = [element_report(mapping[e], struct, result)
-                for e in self.elements if e in mapping]
+        style = self.dof_style_tag()
+        body = [global_report(struct, result, style)] if struct is not None else []
+        body += [element_report(mapping[e], struct, result, style=style)
+                 for e in self.elements if e in mapping]
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(header) + "\n\n" + "\n\n".join(body) + "\n")
@@ -804,9 +1076,9 @@ class FrameDesignerPanel(ttk.Frame):
     # ------------------------------------------------------------------
     def _refresh_lists(self):
         self.node_list.delete(0, "end")
-        for n in self.nodes:
+        for k, n in enumerate(self.nodes):
             self.node_list.insert(
-                "end", f"{n.label()}  ({n.x:.2f}, {n.y:.2f})  [{n.support}]")
+                "end", f"{k}: {n.label()}  ({n.x:.2f}, {n.y:.2f})  [{n.support_text()}]")
         self.elem_list.delete(0, "end")
         for e in self.elements:
             self.elem_list.insert("end", f"{e.label()}  L={e.length():.2f}m{e.end_marks()}")
@@ -844,12 +1116,54 @@ class FrameDesignerPanel(ttk.Frame):
         self._load_elem_editor(e)
         self._redraw()
 
+    def dof_style_tag(self):
+        return LABEL_TO_DOF_STYLE.get(self.dof_style.get(), "uvt")
+
+    def _move_node(self, delta):
+        """
+        Move the selected node up or down the list. The list order IS the
+        global DOF order, so this is how the Q vector gets reordered.
+        """
+        n = self.selected_node or self.node_editor_target
+        if n is None or n not in self.nodes:
+            messagebox.showinfo("No node selected",
+                                "Select a node first, then move it.",
+                                parent=self.winfo_toplevel())
+            return
+        i = self.nodes.index(n)
+        j = i + delta
+        if not (0 <= j < len(self.nodes)):
+            return
+        self.nodes[i], self.nodes[j] = self.nodes[j], self.nodes[i]
+        self._invalidate_result()
+        self._refresh_lists()
+        self._select_node_in_list(n)
+        self._redraw()
+
+    def _refresh_reports(self):
+        """Re-render the working tabs, e.g. after the DOF naming style changes."""
+        self._sync_element_tabs()
+
+    def _on_support_changed(self, _evt=None):
+        """A Fixed support holds rotation by definition, so lock the tick box."""
+        if self.n_support.get() == "Fixed":
+            self.n_rot.set(True)
+            self.n_rot_check.state(["disabled"])
+        else:
+            self.n_rot_check.state(["!disabled"])
+
     def _load_node_editor(self, n):
         self.node_editor_target = n
-        self.n_coord_lbl.config(text=f"Node: {n.label()}  ({n.x:.2f}, {n.y:.2f})")
+        pos = self.nodes.index(n) if n in self.nodes else -1
+        self.n_coord_lbl.config(
+            text=f"Node: {n.label()}  ({n.x:.2f}, {n.y:.2f})   "
+                 f"-> Q rows {3*pos}-{3*pos+2}" if pos >= 0 else f"Node: {n.label()}")
+        self.n_name.set(n.name)
         self.n_x.set(f"{n.x:.4f}")
         self.n_y.set(f"{n.y:.4f}")
         self.n_support.set(n.support)
+        self.n_rot.set(n.restrain_rotation)
+        self._on_support_changed()
         self.n_fx.set(str(n.Fx))
         self.n_fy.set(str(n.Fy))
         self.n_m.set(str(n.M))
@@ -897,7 +1211,12 @@ class FrameDesignerPanel(ttk.Frame):
         try:
             new_x = float(self.n_x.get())
             new_y = float(self.n_y.get())
+            new_name = self.n_name.get().strip()
+            if new_name:
+                n.name = new_name
             n.support = self.n_support.get()
+            # a Fixed support holds rotation whatever the tick box says
+            n.restrain_rotation = bool(self.n_rot.get()) or n.support == "Fixed"
             n.Fx = float(self.n_fx.get())
             n.Fy = float(self.n_fy.get())
             n.M = float(self.n_m.get())
@@ -1121,7 +1440,14 @@ class FrameDesignerPanel(ttk.Frame):
             nodes = []
             for nd in data["nodes"]:
                 n = NodeItem(float(nd["x"]), float(nd["y"]))
+                if nd.get("name"):
+                    n.name = str(nd["name"])
+                dn = nd.get("dof_names") or ["", "", ""]
+                n.dof_names = [str(x) for x in (list(dn) + ["", "", ""])[:3]]
                 n.support = nd.get("support", "Free")
+                # older files have no rotation flag: Fixed held it, nothing else did
+                n.restrain_rotation = bool(nd.get("restrain_rotation",
+                                                  n.support == "Fixed"))
                 n.Fx, n.Fy, n.M = (float(nd.get("Fx", 0)), float(nd.get("Fy", 0)),
                                    float(nd.get("M", 0)))
                 nodes.append(n)
@@ -1137,6 +1463,8 @@ class FrameDesignerPanel(ttk.Frame):
                 e.lvl_dir = ed.get("lvl_dir", "local")
                 e.release_i = bool(ed.get("release_i", False))
                 e.release_j = bool(ed.get("release_j", False))
+                rn = ed.get("release_names") or ["", ""]
+                e.release_names = [str(x) for x in (list(rn) + ["", ""])[:2]]
                 e.point_loads = [[float(p[0]), float(p[1]),
                                   p[2] if len(p) > 2 else "local"]
                                  for p in ed.get("point_loads", [])]
@@ -1162,7 +1490,9 @@ class FrameDesignerPanel(ttk.Frame):
         node_map = {}
         for n in self.nodes:
             support, axis = split_support(n.support)
-            fen = Node(n.id, n.x, n.y, support=support, roller_axis=axis)
+            fen = Node(n.id, n.x, n.y, support=support, roller_axis=axis,
+                       restrain_rotation=n.restrain_rotation, name=n.name)
+            fen.dof_names = list(n.dof_names)
             fen.loads = [n.Fx, n.Fy, n.M]
             fe_nodes.append(fen)
             node_map[n] = fen
@@ -1176,6 +1506,7 @@ class FrameDesignerPanel(ttk.Frame):
                           udl_dir=e.udl_dir, lvl_dir=e.lvl_dir,
                           release_i=e.release_i, release_j=e.release_j,
                           point_loads=[tuple(p) for p in e.point_loads])
+            fee.release_names = list(e.release_names)
             fe_elements.append(fee)
             mapping[e] = fee
 
@@ -1200,7 +1531,7 @@ class FrameDesignerPanel(ttk.Frame):
                                    parent=top)
             return False
 
-        if not any(n.support != "Free" for n in self.nodes):
+        if not any(n.is_supported() for n in self.nodes):
             messagebox.showwarning("No supports", "Add at least one support before solving.",
                                    parent=top)
             return False
@@ -1232,22 +1563,60 @@ class FrameDesignerPanel(ttk.Frame):
         lines.append("=" * 66)
         lines.append("NODAL DISPLACEMENTS")
         lines.append("=" * 66)
+        labels = self.struct.dof_labels(self.dof_style_tag())
+        restrained = set(r["restrained"])
+        lines.append("  dof  label            value                  ")
+        lines.append("  " + "-" * 62)
         for idx, n in enumerate(self.nodes):
-            u, v, th = r["q"][[3*idx, 3*idx+1, 3*idx+2], 0]
-            lines.append(f"{n.label():>4}  ux={u*1e3:10.4f} mm   "
-                         f"uy={v*1e3:10.4f} mm   rot={th*1e3:10.5f} mrad")
+            for c, (unit, mult) in enumerate([("mm", 1e3), ("mm", 1e3), ("mrad", 1e3)]):
+                d = 3*idx + c
+                held = " (restrained)" if d in restrained else ""
+                lines.append(f"  {d:>3}  {labels[d]:<16} "
+                             f"{r['q'][d, 0]*mult:12.5f} {unit}{held}")
+        extra = [d for d in range(3*len(self.nodes), self.struct.ndof)]
+        for d in extra:
+            lines.append(f"  {d:>3}  {labels[d]:<16} "
+                         f"{r['q'][d, 0]*1e3:12.5f} mrad   (hinged member end)")
+        lines.append("")
+        free = [d for d in range(self.struct.ndof) if d not in restrained]
+        lines.append("Free DOFs -- these are the ones that appear in the displacement")
+        lines.append("vector that gets solved:")
+        lines.append("   " + (", ".join(f"{labels[d]} ({d})" for d in free) or "(none)"))
 
         lines.append("")
         lines.append("=" * 66)
         lines.append("SUPPORT REACTIONS")
         lines.append("=" * 66)
+        any_support = False
         for idx, n in enumerate(self.nodes):
-            if n.support == "Free":
+            if not n.is_supported():
                 continue
+            any_support = True
             Rx, Ry, M = r["R"][[3*idx, 3*idx+1, 3*idx+2], 0]
-            lines.append(f"{n.label():>4} [{n.support:>8}]  "
-                         f"Rx={Rx:12.2f} N   Ry={Ry:12.2f} N   M={M:12.2f} Nm")
-        lines.append("(A Roller-Y carries Ry only; a Roller-X carries Rx only.)")
+            tx, ty, rot = n.restraints()
+            # only restrained DOFs carry a reaction; blank the others so the
+            # table cannot be misread
+            sx = f"{Rx:12.2f} N" if tx else "        --  "
+            sy = f"{Ry:12.2f} N" if ty else "        --  "
+            sm = f"{M:12.2f} Nm" if rot else "        --   "
+            lines.append(f"{n.label():>4} [{n.support_text():>16}]  "
+                         f"Rx={sx}   Ry={sy}   M={sm}")
+        if not any_support:
+            lines.append("(none)")
+        lines.append("('--' means that DOF is free, so it carries no reaction.")
+        lines.append(" A roller with its rotation restrained is a guided support:")
+        lines.append(" it slides along its free axis but does carry a moment.)")
+
+        held = sorted(restrained)
+        if held:
+            lines.append("")
+            lines.append("Support reaction vector, one row per restrained DOF:")
+            lines.append("  dof  label            reaction")
+            lines.append("  " + "-" * 48)
+            for dof in held:
+                unit = "Nm" if dof % 3 == 2 else "N"
+                lines.append(f"  {dof:>3}  {labels[dof]:<16} "
+                             f"{r['R'][dof, 0]:14.2f} {unit}")
 
         lines.append("")
         lines.append("=" * 66)
@@ -1418,31 +1787,56 @@ class FrameDesignerPanel(ttk.Frame):
         self.canvas.draw_idle()
 
     def _draw_support_symbol(self, n):
+        """
+        Drawn from the restraints actually applied, not from the type name, so
+        the glyph never disagrees with the maths. A roller whose rotation is
+        held gets the guided-support symbol: a rigid bar on rollers, rather
+        than a triangle pinned at the node.
+        """
         s = 0.3
-        if n.support == "Fixed":
+        tx, ty, rot = n.restraints()
+
+        if tx and ty and rot:                       # fully fixed
             self.ax.plot([n.x - s, n.x + s], [n.y - s, n.y - s], color="black", lw=2)
             for i in range(5):
                 xx = n.x - s + i * (2*s/4)
                 self.ax.plot([xx, xx - 0.08], [n.y - s, n.y - s - 0.15], color="black", lw=1)
-        elif n.support == "Pinned":
+        elif tx and ty:                             # pinned
             self.ax.plot([n.x, n.x - s*0.6, n.x + s*0.6, n.x],
                          [n.y, n.y - s, n.y - s, n.y], color="black", lw=1.5)
-        elif n.support == "Roller-Y":
-            # Rolls horizontally: triangle below the node, rollers underneath
+        elif ty and not rot:                        # roller, rolls horizontally
             self.ax.plot([n.x, n.x - s*0.6, n.x + s*0.6, n.x],
                          [n.y, n.y - s, n.y - s, n.y], color="black", lw=1.5)
             self.ax.plot([n.x - s*0.6, n.x + s*0.6], [n.y - s - 0.08, n.y - s - 0.08],
                          color="black", lw=1.5)
             for dx in (-s*0.3, s*0.3):
                 self.ax.add_patch(plt_circle(n.x + dx, n.y - s - 0.04, 0.04))
-        elif n.support == "Roller-X":
-            # Rolls vertically: triangle to the left of the node, rollers beside it
+        elif ty and rot:                            # guided: slides in X, no rotation
+            self.ax.plot([n.x - s*0.7, n.x + s*0.7], [n.y, n.y], color="black", lw=2.5)
+            self.ax.plot([n.x, n.x], [n.y, n.y - s*0.35], color="black", lw=1.5)
+            self.ax.plot([n.x - s*0.7, n.x + s*0.7],
+                         [n.y - s*0.55, n.y - s*0.55], color="black", lw=1.5)
+            for dx in (-s*0.35, s*0.35):
+                self.ax.add_patch(plt_circle(n.x + dx, n.y - s*0.45, 0.045))
+        elif tx and not rot:                        # roller, rolls vertically
             self.ax.plot([n.x, n.x - s, n.x - s, n.x],
                          [n.y, n.y - s*0.6, n.y + s*0.6, n.y], color="black", lw=1.5)
             self.ax.plot([n.x - s - 0.08, n.x - s - 0.08], [n.y - s*0.6, n.y + s*0.6],
                          color="black", lw=1.5)
             for dy in (-s*0.3, s*0.3):
                 self.ax.add_patch(plt_circle(n.x - s - 0.04, n.y + dy, 0.04))
+        elif tx and rot:                            # guided: slides in Y, no rotation
+            self.ax.plot([n.x, n.x], [n.y - s*0.7, n.y + s*0.7], color="black", lw=2.5)
+            self.ax.plot([n.x, n.x - s*0.35], [n.y, n.y], color="black", lw=1.5)
+            self.ax.plot([n.x - s*0.55, n.x - s*0.55],
+                         [n.y - s*0.7, n.y + s*0.7], color="black", lw=1.5)
+            for dy in (-s*0.35, s*0.35):
+                self.ax.add_patch(plt_circle(n.x - s*0.45, n.y + dy, 0.045))
+        elif rot:                                   # rotation only (symmetry line)
+            r = s * 0.45
+            self.ax.plot([n.x - r, n.x + r, n.x + r, n.x - r, n.x - r],
+                         [n.y - r, n.y - r, n.y + r, n.y + r, n.y - r],
+                         color="black", lw=1.5)
 
     def _draw_nodal_load_arrow(self, n):
         scale = 0.6
