@@ -14,6 +14,7 @@ Requires: numpy, matplotlib (tkinter ships with standard Python on Windows/Mac;
 on Linux install e.g. `sudo apt install python3-tk`).
 Xg = u(x)cos(alpha) - v(x)sin(alpha)
 Yg = u(x)sin(alpha) + v(x)cos(alpha)
+Q_vector is degrees of freedom, extract from each local element and sum into global Q vector.
 """
 
 import json
